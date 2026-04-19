@@ -1,8 +1,18 @@
 use std::sync::OnceLock;
 
+#[cfg(target_arch = "aarch64")]
+use std::arch::aarch64::{
+    float32x4_t, vaddq_f32, vaddvq_f32, vdupq_n_f32, vfmaq_f32, vfmsq_f32, vld1q_f32, vmulq_f32,
+    vst1q_f32,
+};
+
 pub(crate) const QMF_SUBBANDS: usize = 64;
 const QMF_DOUBLE_LENGTH: usize = QMF_SUBBANDS * 2;
 const QMF_COEFFS_LEN: usize = 640;
+const QMF_FORWARD_RING_LEN: usize = QMF_COEFFS_LEN;
+const QMF_FORWARD_STORAGE_LEN: usize = QMF_FORWARD_RING_LEN * 2;
+const QMF_INVERSE_RING_LEN: usize = QMF_COEFFS_LEN * 2;
+const QMF_INVERSE_STORAGE_LEN: usize = QMF_INVERSE_RING_LEN * 2;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct QmfSubbands {
@@ -21,18 +31,19 @@ impl QmfSubbands {
 
 #[derive(Debug, Clone)]
 pub(crate) struct QuadratureMirrorFilterBank {
-    input_stream_forward: [f32; QMF_COEFFS_LEN],
+    // Mirror the ring buffer so each active window is always contiguous.
+    input_stream_forward: [f32; QMF_FORWARD_STORAGE_LEN],
     input_stream_forward_head: usize,
-    input_stream_inverse: [f32; QMF_COEFFS_LEN * 2],
+    input_stream_inverse: [f32; QMF_INVERSE_STORAGE_LEN],
     input_stream_inverse_head: usize,
 }
 
 impl QuadratureMirrorFilterBank {
     pub fn new() -> Self {
         Self {
-            input_stream_forward: [0.0; QMF_COEFFS_LEN],
+            input_stream_forward: [0.0; QMF_FORWARD_STORAGE_LEN],
             input_stream_forward_head: 0,
-            input_stream_inverse: [0.0; QMF_COEFFS_LEN * 2],
+            input_stream_inverse: [0.0; QMF_INVERSE_STORAGE_LEN],
             input_stream_inverse_head: 0,
         }
     }
@@ -40,31 +51,27 @@ impl QuadratureMirrorFilterBank {
     pub fn process_forward(&mut self, input: &[f32]) -> QmfSubbands {
         debug_assert_eq!(input.len(), QMF_SUBBANDS);
 
-        self.input_stream_forward_head =
-            wrap_ring_head(self.input_stream_forward_head, QMF_SUBBANDS, QMF_COEFFS_LEN);
+        self.input_stream_forward_head = wrap_ring_head(
+            self.input_stream_forward_head,
+            QMF_SUBBANDS,
+            QMF_FORWARD_RING_LEN,
+        );
         for (offset, sample) in input.iter().rev().enumerate() {
-            let slot = ring_index(self.input_stream_forward_head, offset, QMF_COEFFS_LEN);
+            let slot = self.input_stream_forward_head + offset;
             self.input_stream_forward[slot] = *sample;
+            self.input_stream_forward[slot + QMF_FORWARD_RING_LEN] = *sample;
         }
 
+        let window = &self.input_stream_forward
+            [self.input_stream_forward_head..self.input_stream_forward_head + QMF_FORWARD_RING_LEN];
         let mut grouping = [0.0f32; QMF_DOUBLE_LENGTH];
-        for (sample, slot) in grouping.iter_mut().enumerate() {
-            let mut sum = 0.0f32;
-            let mut source = sample;
-            while source < QMF_COEFFS_LEN {
-                sum += self.input_stream_forward
-                    [ring_index(self.input_stream_forward_head, source, QMF_COEFFS_LEN)]
-                    * QMF_COEFFS[source];
-                source += QMF_DOUBLE_LENGTH;
-            }
-            *slot = sum;
-        }
+        compute_forward_grouping(window, &mut grouping);
 
         let cache = qmf_cache();
         let mut result = QmfSubbands::zero();
         for subband in 0..QMF_SUBBANDS {
-            result.real[subband] = dot(&cache.forward_real[subband], &grouping);
-            result.imaginary[subband] = dot(&cache.forward_imaginary[subband], &grouping);
+            result.real[subband] = dot_product(&cache.forward_real[subband], &grouping);
+            result.imaginary[subband] = dot_product(&cache.forward_imaginary[subband], &grouping);
         }
         result
     }
@@ -72,53 +79,28 @@ impl QuadratureMirrorFilterBank {
     pub fn process_inverse(&mut self, input: &QmfSubbands, output: &mut [f32]) {
         debug_assert_eq!(output.len(), QMF_SUBBANDS);
 
-        let inverse_len = self.input_stream_inverse.len();
         self.input_stream_inverse_head = wrap_ring_head(
             self.input_stream_inverse_head,
             QMF_DOUBLE_LENGTH,
-            inverse_len,
+            QMF_INVERSE_RING_LEN,
         );
 
         let cache = qmf_cache();
         for sample in 0..QMF_DOUBLE_LENGTH {
-            let mut value = 0.0f32;
-            for subband in 0..QMF_SUBBANDS {
-                value += cache.inverse_real[subband][sample] * input.real[subband];
-                value -= cache.inverse_imaginary[subband][sample] * input.imaginary[subband];
-            }
-            let slot = ring_index(self.input_stream_inverse_head, sample, inverse_len);
+            let value = dot_product_signed(
+                &cache.inverse_real_by_sample[sample],
+                &input.real,
+                &cache.inverse_imaginary_by_sample[sample],
+                &input.imaginary,
+            );
+            let slot = self.input_stream_inverse_head + sample;
             self.input_stream_inverse[slot] = value;
+            self.input_stream_inverse[slot + QMF_INVERSE_RING_LEN] = value;
         }
 
-        output.fill(0.0);
-        for sample in 0..QMF_SUBBANDS {
-            output[sample] = self.input_stream_inverse
-                [ring_index(self.input_stream_inverse_head, sample, inverse_len)]
-                * QMF_COEFFS[sample]
-                + self.input_stream_inverse[ring_index(
-                    self.input_stream_inverse_head,
-                    QMF_SUBBANDS * 3 + sample,
-                    inverse_len,
-                )] * QMF_COEFFS[QMF_SUBBANDS + sample];
-        }
-        for group in 1..(QMF_COEFFS_LEN / QMF_DOUBLE_LENGTH) {
-            let time_slot = QMF_SUBBANDS * 4 * group;
-            let coeff_slot = QMF_DOUBLE_LENGTH * group;
-            let time_pair = time_slot + QMF_SUBBANDS * 3;
-            let coeff_pair = coeff_slot + QMF_SUBBANDS;
-            for sample in 0..QMF_SUBBANDS {
-                output[sample] += self.input_stream_inverse[ring_index(
-                    self.input_stream_inverse_head,
-                    time_slot + sample,
-                    inverse_len,
-                )] * QMF_COEFFS[coeff_slot + sample]
-                    + self.input_stream_inverse[ring_index(
-                        self.input_stream_inverse_head,
-                        time_pair + sample,
-                        inverse_len,
-                    )] * QMF_COEFFS[coeff_pair + sample];
-            }
-        }
+        let window = &self.input_stream_inverse
+            [self.input_stream_inverse_head..self.input_stream_inverse_head + QMF_INVERSE_RING_LEN];
+        compute_inverse_output(window, output);
     }
 }
 
@@ -128,12 +110,105 @@ impl Default for QuadratureMirrorFilterBank {
     }
 }
 
-fn dot(lhs: &[f32; QMF_DOUBLE_LENGTH], rhs: &[f32; QMF_DOUBLE_LENGTH]) -> f32 {
+fn dot_product(lhs: &[f32; QMF_DOUBLE_LENGTH], rhs: &[f32; QMF_DOUBLE_LENGTH]) -> f32 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { dot_product_neon(lhs.as_ptr(), rhs.as_ptr(), QMF_DOUBLE_LENGTH) }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        dot_product_scalar(lhs, rhs)
+    }
+}
+
+fn dot_product_scalar(lhs: &[f32], rhs: &[f32]) -> f32 {
     let mut sum = 0.0f32;
-    for index in 0..QMF_DOUBLE_LENGTH {
+    for index in 0..lhs.len() {
         sum += lhs[index] * rhs[index];
     }
     sum
+}
+
+fn dot_product_signed(
+    positive_lhs: &[f32; QMF_SUBBANDS],
+    positive_rhs: &[f32; QMF_SUBBANDS],
+    negative_lhs: &[f32; QMF_SUBBANDS],
+    negative_rhs: &[f32; QMF_SUBBANDS],
+) -> f32 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe {
+            dot_product_signed_neon(
+                positive_lhs.as_ptr(),
+                positive_rhs.as_ptr(),
+                negative_lhs.as_ptr(),
+                negative_rhs.as_ptr(),
+                QMF_SUBBANDS,
+            )
+        }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let mut sum = 0.0f32;
+        for index in 0..QMF_SUBBANDS {
+            sum += positive_lhs[index] * positive_rhs[index];
+            sum -= negative_lhs[index] * negative_rhs[index];
+        }
+        sum
+    }
+}
+
+fn compute_forward_grouping(window: &[f32], grouping: &mut [f32; QMF_DOUBLE_LENGTH]) {
+    debug_assert_eq!(window.len(), QMF_FORWARD_RING_LEN);
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { compute_forward_grouping_neon(window.as_ptr(), grouping.as_mut_ptr()) };
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        compute_forward_grouping_scalar(window, grouping);
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn compute_forward_grouping_scalar(window: &[f32], grouping: &mut [f32; QMF_DOUBLE_LENGTH]) {
+    for sample in 0..QMF_DOUBLE_LENGTH {
+        grouping[sample] = window[sample] * QMF_COEFFS[sample]
+            + window[QMF_DOUBLE_LENGTH + sample] * QMF_COEFFS[QMF_DOUBLE_LENGTH + sample]
+            + window[QMF_DOUBLE_LENGTH * 2 + sample] * QMF_COEFFS[QMF_DOUBLE_LENGTH * 2 + sample]
+            + window[QMF_DOUBLE_LENGTH * 3 + sample] * QMF_COEFFS[QMF_DOUBLE_LENGTH * 3 + sample]
+            + window[QMF_DOUBLE_LENGTH * 4 + sample] * QMF_COEFFS[QMF_DOUBLE_LENGTH * 4 + sample];
+    }
+}
+
+fn compute_inverse_output(window: &[f32], output: &mut [f32]) {
+    debug_assert_eq!(window.len(), QMF_INVERSE_RING_LEN);
+    debug_assert_eq!(output.len(), QMF_SUBBANDS);
+    #[cfg(target_arch = "aarch64")]
+    {
+        unsafe { compute_inverse_output_neon(window.as_ptr(), output.as_mut_ptr()) };
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        compute_inverse_output_scalar(window, output);
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+fn compute_inverse_output_scalar(window: &[f32], output: &mut [f32]) {
+    for sample in 0..QMF_SUBBANDS {
+        let mut value = window[sample] * QMF_COEFFS[sample]
+            + window[QMF_SUBBANDS * 3 + sample] * QMF_COEFFS[QMF_SUBBANDS + sample];
+        for group in 1..(QMF_COEFFS_LEN / QMF_DOUBLE_LENGTH) {
+            let time_slot = QMF_SUBBANDS * 4 * group;
+            let coeff_slot = QMF_DOUBLE_LENGTH * group;
+            let time_pair = time_slot + QMF_SUBBANDS * 3;
+            let coeff_pair = coeff_slot + QMF_SUBBANDS;
+            value += window[time_slot + sample] * QMF_COEFFS[coeff_slot + sample]
+                + window[time_pair + sample] * QMF_COEFFS[coeff_pair + sample];
+        }
+        output[sample] = value;
+    }
 }
 
 #[inline]
@@ -145,17 +220,11 @@ fn wrap_ring_head(head: usize, step: usize, len: usize) -> usize {
     }
 }
 
-#[inline]
-fn ring_index(head: usize, offset: usize, len: usize) -> usize {
-    let index = head + offset;
-    if index >= len { index - len } else { index }
-}
-
 struct QmfCache {
     forward_real: [[f32; QMF_DOUBLE_LENGTH]; QMF_SUBBANDS],
     forward_imaginary: [[f32; QMF_DOUBLE_LENGTH]; QMF_SUBBANDS],
-    inverse_real: [[f32; QMF_DOUBLE_LENGTH]; QMF_SUBBANDS],
-    inverse_imaginary: [[f32; QMF_DOUBLE_LENGTH]; QMF_SUBBANDS],
+    inverse_real_by_sample: [[f32; QMF_SUBBANDS]; QMF_DOUBLE_LENGTH],
+    inverse_imaginary_by_sample: [[f32; QMF_SUBBANDS]; QMF_DOUBLE_LENGTH],
 }
 
 fn qmf_cache() -> &'static QmfCache {
@@ -164,8 +233,8 @@ fn qmf_cache() -> &'static QmfCache {
         let mut cache = QmfCache {
             forward_real: [[0.0; QMF_DOUBLE_LENGTH]; QMF_SUBBANDS],
             forward_imaginary: [[0.0; QMF_DOUBLE_LENGTH]; QMF_SUBBANDS],
-            inverse_real: [[0.0; QMF_DOUBLE_LENGTH]; QMF_SUBBANDS],
-            inverse_imaginary: [[0.0; QMF_DOUBLE_LENGTH]; QMF_SUBBANDS],
+            inverse_real_by_sample: [[0.0; QMF_SUBBANDS]; QMF_DOUBLE_LENGTH],
+            inverse_imaginary_by_sample: [[0.0; QMF_SUBBANDS]; QMF_DOUBLE_LENGTH],
         };
         let subband_div = 1.0f32 / QMF_SUBBANDS as f32;
         for subband in 0..QMF_SUBBANDS {
@@ -181,12 +250,199 @@ fn qmf_cache() -> &'static QmfCache {
                     * (subband as f32 + 0.5)
                     * (sample as f32 - QMF_DOUBLE_LENGTH as f32 + 0.5)
                     * subband_div;
-                cache.inverse_real[subband][sample] = inverse_exp.cos() * subband_div;
-                cache.inverse_imaginary[subband][sample] = inverse_exp.sin() * subband_div;
+                cache.inverse_real_by_sample[sample][subband] = inverse_exp.cos() * subband_div;
+                cache.inverse_imaginary_by_sample[sample][subband] =
+                    inverse_exp.sin() * subband_div;
             }
         }
         cache
     })
+}
+
+#[cfg(target_arch = "aarch64")]
+#[allow(unsafe_op_in_unsafe_fn)]
+#[inline(always)]
+unsafe fn horizontal_sum_f32x4(
+    acc0: float32x4_t,
+    acc1: float32x4_t,
+    acc2: float32x4_t,
+    acc3: float32x4_t,
+) -> f32 {
+    vaddvq_f32(vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3)))
+}
+
+#[cfg(target_arch = "aarch64")]
+#[allow(unsafe_op_in_unsafe_fn)]
+#[inline(always)]
+unsafe fn dot_product_neon(lhs: *const f32, rhs: *const f32, len: usize) -> f32 {
+    let mut acc0 = vdupq_n_f32(0.0);
+    let mut acc1 = vdupq_n_f32(0.0);
+    let mut acc2 = vdupq_n_f32(0.0);
+    let mut acc3 = vdupq_n_f32(0.0);
+    let mut index = 0usize;
+    while index + 16 <= len {
+        acc0 = vfmaq_f32(acc0, vld1q_f32(lhs.add(index)), vld1q_f32(rhs.add(index)));
+        acc1 = vfmaq_f32(
+            acc1,
+            vld1q_f32(lhs.add(index + 4)),
+            vld1q_f32(rhs.add(index + 4)),
+        );
+        acc2 = vfmaq_f32(
+            acc2,
+            vld1q_f32(lhs.add(index + 8)),
+            vld1q_f32(rhs.add(index + 8)),
+        );
+        acc3 = vfmaq_f32(
+            acc3,
+            vld1q_f32(lhs.add(index + 12)),
+            vld1q_f32(rhs.add(index + 12)),
+        );
+        index += 16;
+    }
+    let mut sum = horizontal_sum_f32x4(acc0, acc1, acc2, acc3);
+    while index < len {
+        sum += *lhs.add(index) * *rhs.add(index);
+        index += 1;
+    }
+    sum
+}
+
+#[cfg(target_arch = "aarch64")]
+#[allow(unsafe_op_in_unsafe_fn)]
+#[inline(always)]
+unsafe fn dot_product_signed_neon(
+    positive_lhs: *const f32,
+    positive_rhs: *const f32,
+    negative_lhs: *const f32,
+    negative_rhs: *const f32,
+    len: usize,
+) -> f32 {
+    let mut acc0 = vdupq_n_f32(0.0);
+    let mut acc1 = vdupq_n_f32(0.0);
+    let mut acc2 = vdupq_n_f32(0.0);
+    let mut acc3 = vdupq_n_f32(0.0);
+    let mut index = 0usize;
+    while index + 16 <= len {
+        acc0 = vfmaq_f32(
+            acc0,
+            vld1q_f32(positive_lhs.add(index)),
+            vld1q_f32(positive_rhs.add(index)),
+        );
+        acc0 = vfmsq_f32(
+            acc0,
+            vld1q_f32(negative_lhs.add(index)),
+            vld1q_f32(negative_rhs.add(index)),
+        );
+        acc1 = vfmaq_f32(
+            acc1,
+            vld1q_f32(positive_lhs.add(index + 4)),
+            vld1q_f32(positive_rhs.add(index + 4)),
+        );
+        acc1 = vfmsq_f32(
+            acc1,
+            vld1q_f32(negative_lhs.add(index + 4)),
+            vld1q_f32(negative_rhs.add(index + 4)),
+        );
+        acc2 = vfmaq_f32(
+            acc2,
+            vld1q_f32(positive_lhs.add(index + 8)),
+            vld1q_f32(positive_rhs.add(index + 8)),
+        );
+        acc2 = vfmsq_f32(
+            acc2,
+            vld1q_f32(negative_lhs.add(index + 8)),
+            vld1q_f32(negative_rhs.add(index + 8)),
+        );
+        acc3 = vfmaq_f32(
+            acc3,
+            vld1q_f32(positive_lhs.add(index + 12)),
+            vld1q_f32(positive_rhs.add(index + 12)),
+        );
+        acc3 = vfmsq_f32(
+            acc3,
+            vld1q_f32(negative_lhs.add(index + 12)),
+            vld1q_f32(negative_rhs.add(index + 12)),
+        );
+        index += 16;
+    }
+    let mut sum = horizontal_sum_f32x4(acc0, acc1, acc2, acc3);
+    while index < len {
+        sum += *positive_lhs.add(index) * *positive_rhs.add(index);
+        sum -= *negative_lhs.add(index) * *negative_rhs.add(index);
+        index += 1;
+    }
+    sum
+}
+
+#[cfg(target_arch = "aarch64")]
+#[allow(unsafe_op_in_unsafe_fn)]
+#[inline(always)]
+unsafe fn compute_forward_grouping_neon(window: *const f32, grouping: *mut f32) {
+    let mut sample = 0usize;
+    while sample < QMF_DOUBLE_LENGTH {
+        let mut acc = vmulq_f32(
+            vld1q_f32(window.add(sample)),
+            vld1q_f32(QMF_COEFFS.as_ptr().add(sample)),
+        );
+        acc = vfmaq_f32(
+            acc,
+            vld1q_f32(window.add(QMF_DOUBLE_LENGTH + sample)),
+            vld1q_f32(QMF_COEFFS.as_ptr().add(QMF_DOUBLE_LENGTH + sample)),
+        );
+        acc = vfmaq_f32(
+            acc,
+            vld1q_f32(window.add(QMF_DOUBLE_LENGTH * 2 + sample)),
+            vld1q_f32(QMF_COEFFS.as_ptr().add(QMF_DOUBLE_LENGTH * 2 + sample)),
+        );
+        acc = vfmaq_f32(
+            acc,
+            vld1q_f32(window.add(QMF_DOUBLE_LENGTH * 3 + sample)),
+            vld1q_f32(QMF_COEFFS.as_ptr().add(QMF_DOUBLE_LENGTH * 3 + sample)),
+        );
+        acc = vfmaq_f32(
+            acc,
+            vld1q_f32(window.add(QMF_DOUBLE_LENGTH * 4 + sample)),
+            vld1q_f32(QMF_COEFFS.as_ptr().add(QMF_DOUBLE_LENGTH * 4 + sample)),
+        );
+        vst1q_f32(grouping.add(sample), acc);
+        sample += 4;
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[allow(unsafe_op_in_unsafe_fn)]
+#[inline(always)]
+unsafe fn compute_inverse_output_neon(window: *const f32, output: *mut f32) {
+    let mut sample = 0usize;
+    while sample < QMF_SUBBANDS {
+        let mut acc = vmulq_f32(
+            vld1q_f32(window.add(sample)),
+            vld1q_f32(QMF_COEFFS.as_ptr().add(sample)),
+        );
+        acc = vfmaq_f32(
+            acc,
+            vld1q_f32(window.add(QMF_SUBBANDS * 3 + sample)),
+            vld1q_f32(QMF_COEFFS.as_ptr().add(QMF_SUBBANDS + sample)),
+        );
+        for group in 1..(QMF_COEFFS_LEN / QMF_DOUBLE_LENGTH) {
+            let time_slot = QMF_SUBBANDS * 4 * group;
+            let coeff_slot = QMF_DOUBLE_LENGTH * group;
+            let time_pair = time_slot + QMF_SUBBANDS * 3;
+            let coeff_pair = coeff_slot + QMF_SUBBANDS;
+            acc = vfmaq_f32(
+                acc,
+                vld1q_f32(window.add(time_slot + sample)),
+                vld1q_f32(QMF_COEFFS.as_ptr().add(coeff_slot + sample)),
+            );
+            acc = vfmaq_f32(
+                acc,
+                vld1q_f32(window.add(time_pair + sample)),
+                vld1q_f32(QMF_COEFFS.as_ptr().add(coeff_pair + sample)),
+            );
+        }
+        vst1q_f32(output.add(sample), acc);
+        sample += 4;
+    }
 }
 
 #[cfg(test)]
@@ -232,8 +488,9 @@ mod tests {
             let cache = qmf_cache();
             let mut result = QmfSubbands::zero();
             for subband in 0..QMF_SUBBANDS {
-                result.real[subband] = dot(&cache.forward_real[subband], &grouping);
-                result.imaginary[subband] = dot(&cache.forward_imaginary[subband], &grouping);
+                result.real[subband] = dot_product_scalar(&cache.forward_real[subband], &grouping);
+                result.imaginary[subband] =
+                    dot_product_scalar(&cache.forward_imaginary[subband], &grouping);
             }
             result
         }
@@ -247,8 +504,9 @@ mod tests {
             for sample in 0..QMF_DOUBLE_LENGTH {
                 let mut value = 0.0f32;
                 for subband in 0..QMF_SUBBANDS {
-                    value += cache.inverse_real[subband][sample] * input.real[subband];
-                    value -= cache.inverse_imaginary[subband][sample] * input.imaginary[subband];
+                    value += cache.inverse_real_by_sample[sample][subband] * input.real[subband];
+                    value -= cache.inverse_imaginary_by_sample[sample][subband]
+                        * input.imaginary[subband];
                 }
                 self.input_stream_inverse[sample] = value;
             }
@@ -330,15 +588,16 @@ mod tests {
     }
 
     fn assert_subbands_close(actual: &QmfSubbands, expected: &QmfSubbands) {
+        const TOLERANCE: f32 = 1e-5;
         for index in 0..QMF_SUBBANDS {
             assert!(
-                (actual.real[index] - expected.real[index]).abs() <= f32::EPSILON,
+                (actual.real[index] - expected.real[index]).abs() <= TOLERANCE,
                 "real[{index}] mismatch: {} vs {}",
                 actual.real[index],
                 expected.real[index],
             );
             assert!(
-                (actual.imaginary[index] - expected.imaginary[index]).abs() <= f32::EPSILON,
+                (actual.imaginary[index] - expected.imaginary[index]).abs() <= TOLERANCE,
                 "imaginary[{index}] mismatch: {} vs {}",
                 actual.imaginary[index],
                 expected.imaginary[index],
@@ -347,9 +606,10 @@ mod tests {
     }
 
     fn assert_output_close(actual: &[f32; QMF_SUBBANDS], expected: &[f32; QMF_SUBBANDS]) {
+        const TOLERANCE: f32 = 1e-5;
         for index in 0..QMF_SUBBANDS {
             assert!(
-                (actual[index] - expected[index]).abs() <= f32::EPSILON,
+                (actual[index] - expected[index]).abs() <= TOLERANCE,
                 "output[{index}] mismatch: {} vs {}",
                 actual[index],
                 expected[index],

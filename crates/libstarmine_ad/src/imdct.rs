@@ -7,8 +7,6 @@ use rustfft::{Fft, FftPlanner, num_complex::Complex32};
 pub(crate) struct ImdctState {
     delay: [f32; 256],
     output: [f32; 512],
-    coeff_split1: [f32; 128],
-    coeff_split2: [f32; 128],
     intermediate_512: [Complex32; 128],
     intermediate_256_a: [Complex32; 64],
     intermediate_256_b: [Complex32; 64],
@@ -19,8 +17,6 @@ impl ImdctState {
         Self {
             delay: [0.0; 256],
             output: [0.0; 512],
-            coeff_split1: [0.0; 128],
-            coeff_split2: [0.0; 128],
             intermediate_512: [Complex32::new(0.0, 0.0); 128],
             intermediate_256_a: [Complex32::new(0.0, 0.0); 64],
             intermediate_256_b: [Complex32::new(0.0, 0.0); 64],
@@ -75,8 +71,7 @@ impl ImdctState {
     }
 
     fn apply_256(&mut self, coeffs: &[f32; 256], output: &mut [f32]) {
-        self.split_256_coefficients(coeffs);
-        self.prepare_256_intermediates();
+        self.prepare_256_intermediates(coeffs);
 
         let fft = imdct_fft_cache();
         fft.ifft_256.process(&mut self.intermediate_256_a);
@@ -116,23 +111,14 @@ impl ImdctState {
         self.delay.copy_from_slice(&self.output[256..512]);
     }
 
-    fn split_256_coefficients(&mut self, coeffs: &[f32; 256]) {
-        for index in 0..128 {
-            self.coeff_split1[index] = coeffs[2 * index];
-            self.coeff_split2[index] = coeffs[2 * index + 1];
-        }
-    }
-
-    fn prepare_256_intermediates(&mut self) {
+    fn prepare_256_intermediates(&mut self, coeffs: &[f32; 256]) {
         let x = x256();
         for (index, slot) in self.intermediate_256_a.iter_mut().enumerate() {
-            *slot = Complex32::new(self.coeff_split1[127 - 2 * index], self.coeff_split1[index])
-                * x[index];
+            *slot = Complex32::new(coeffs[254 - 4 * index], coeffs[2 * index]) * x[index];
         }
         // https://github.com/FFmpeg/FFmpeg/blob/415b466d41ac81856abc76d7a9341132b0f668b0/libavcodec/ac3dec.c#L587
         for (index, slot) in self.intermediate_256_b.iter_mut().enumerate() {
-            *slot = Complex32::new(self.coeff_split2[127 - 2 * index], self.coeff_split2[index])
-                * x[index];
+            *slot = Complex32::new(coeffs[255 - 4 * index], coeffs[2 * index + 1]) * x[index];
         }
     }
 }
@@ -228,8 +214,7 @@ mod tests {
         coeffs[1] = 3.0;
         coeffs[255] = 5.0;
 
-        state.split_256_coefficients(&coeffs);
-        state.prepare_256_intermediates();
+        state.prepare_256_intermediates(&coeffs);
 
         let sample = state.intermediate_256_b[0];
         let expected = Complex32::new(5.0, 3.0) * x256()[0];

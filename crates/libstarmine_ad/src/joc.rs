@@ -43,6 +43,7 @@ pub(crate) struct JocObjectDecoderState {
     forward_qmf: Vec<QuadratureMirrorFilterBank>,
     inverse_qmf: Vec<QuadratureMirrorFilterBank>,
     inverse_history: Vec<bool>,
+    analysis: Vec<QmfSubbands>,
     last_frame_matrices: JocObjectMatrices,
 }
 
@@ -54,6 +55,7 @@ impl JocObjectDecoderState {
         self.forward_qmf.clear();
         self.inverse_qmf.clear();
         self.inverse_history.clear();
+        self.analysis.clear();
         self.last_frame_matrices.clear();
     }
 
@@ -62,6 +64,17 @@ impl JocObjectDecoderState {
         core: &CorePcmFrame,
         joc: &JocPayload,
     ) -> Result<Vec<Vec<f32>>, ParseError> {
+        let mut objects = Vec::new();
+        self.decode_frame_into(core, joc, &mut objects)?;
+        Ok(objects)
+    }
+
+    pub fn decode_frame_into(
+        &mut self,
+        core: &CorePcmFrame,
+        joc: &JocPayload,
+        objects: &mut Vec<Vec<f32>>,
+    ) -> Result<(), ParseError> {
         if joc.channel_count > JOC_INPUT_ORDER.len() {
             return Err(ParseError::UnsupportedFeature("joc-channel-count"));
         }
@@ -73,10 +86,10 @@ impl JocObjectDecoderState {
         let input_indices = map_input_channel_indices(core, joc.channel_count)?;
         let timeslots = samples / QMF_SUBBANDS;
         self.reconfigure(joc.channel_count, joc.object_count);
-
-        self.last_frame_matrices = self.build_frame_matrices(joc, timeslots)?;
-        let mut objects = vec![vec![0.0f32; samples]; joc.object_count];
-        let mut analysis = vec![QmfSubbands::zero(); joc.channel_count];
+        self.build_frame_matrices(joc, timeslots)?;
+        prepare_object_output_buffers(objects, joc.object_count, samples);
+        self.analysis.resize(joc.channel_count, QmfSubbands::zero());
+        let analysis = &mut self.analysis[..joc.channel_count];
 
         for timeslot in 0..timeslots {
             let sample_offset = timeslot * QMF_SUBBANDS;
@@ -119,7 +132,7 @@ impl JocObjectDecoderState {
             }
         }
 
-        Ok(objects)
+        Ok(())
     }
 
     pub fn last_frame_matrices(&self) -> &JocObjectMatrices {
@@ -142,6 +155,10 @@ impl JocObjectDecoderState {
         self.inverse_history.resize(object_count, false);
         if self.inverse_history.len() > object_count {
             self.inverse_history.truncate(object_count);
+        }
+        self.analysis.resize(channel_count, QmfSubbands::zero());
+        if self.analysis.len() > channel_count {
+            self.analysis.truncate(channel_count);
         }
 
         self.prev_matrix
@@ -184,9 +201,13 @@ impl JocObjectDecoderState {
         &mut self,
         joc: &JocPayload,
         timeslots: usize,
-    ) -> Result<Vec<TimeslotMatrices>, ParseError> {
-        let mut objects =
-            vec![vec![vec![[0.0; QMF_SUBBANDS]; joc.channel_count]; timeslots]; joc.object_count];
+    ) -> Result<(), ParseError> {
+        ensure_object_matrix_storage(
+            &mut self.last_frame_matrices,
+            joc.object_count,
+            timeslots,
+            joc.channel_count,
+        );
         for object_index in 0..joc.object_count {
             let object = joc
                 .objects
@@ -202,10 +223,45 @@ impl JocObjectDecoderState {
                 *timeslot_offsets,
                 object,
                 timeslots,
-                &mut objects[object_index],
+                &mut self.last_frame_matrices[object_index],
             )?;
         }
-        Ok(objects)
+        Ok(())
+    }
+}
+
+fn prepare_object_output_buffers(output: &mut Vec<Vec<f32>>, object_count: usize, samples: usize) {
+    output.resize_with(object_count, Vec::new);
+    if output.len() > object_count {
+        output.truncate(object_count);
+    }
+    for channel in output.iter_mut() {
+        channel.resize(samples, 0.0);
+        channel.fill(0.0);
+    }
+}
+
+fn ensure_object_matrix_storage(
+    storage: &mut JocObjectMatrices,
+    object_count: usize,
+    timeslots: usize,
+    channel_count: usize,
+) {
+    storage.resize_with(object_count, Vec::new);
+    if storage.len() > object_count {
+        storage.truncate(object_count);
+    }
+    for object in storage.iter_mut() {
+        object.resize_with(timeslots, Vec::new);
+        if object.len() > timeslots {
+            object.truncate(timeslots);
+        }
+        for timeslot in object.iter_mut() {
+            timeslot.resize(channel_count, [0.0; QMF_SUBBANDS]);
+            if timeslot.len() > channel_count {
+                timeslot.truncate(channel_count);
+            }
+        }
     }
 }
 
@@ -218,6 +274,7 @@ fn build_object_timeslots(
     output: &mut TimeslotMatrices,
 ) -> Result<(), ParseError> {
     if !object.active {
+        zero_timeslot_matrices(output);
         return Ok(());
     }
 
@@ -270,6 +327,14 @@ fn build_object_timeslots(
 
     update_prev_matrix(prev_matrix, &mix_matrix[object.data_points - 1], mapping);
     Ok(())
+}
+
+fn zero_timeslot_matrices(output: &mut TimeslotMatrices) {
+    for timeslot in output.iter_mut() {
+        for channel in timeslot.iter_mut() {
+            *channel = [0.0; QMF_SUBBANDS];
+        }
+    }
 }
 
 fn map_input_channel_indices(

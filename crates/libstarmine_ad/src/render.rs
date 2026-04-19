@@ -226,7 +226,21 @@ impl Renderer714 {
 
     /// Render one [`ObjectPcmFrame`] to 7.1.4 float PCM.
     pub fn push_frame(&mut self, frame: &ObjectPcmFrame) -> Result<Render714Frame, Render714Error> {
-        self.push_frame_impl(frame, None)
+        let samples = frame.samples_per_channel();
+        let mut channels = vec![vec![0.0f32; samples]; RENDER_714_CHANNELS];
+        self.push_frame_parts_impl(
+            &frame.core,
+            &frame.object_channels,
+            frame.oamd.as_ref(),
+            frame.oamd_sample_offset,
+            &mut channels,
+            None,
+        )?;
+        Ok(Render714Frame {
+            sample_rate: frame.core.sample_rate,
+            channel_order: RENDER_714_CHANNEL_ORDER.to_vec(),
+            channels,
+        })
     }
 
     /// Render one frame and also capture the effective source state for every 64-sample timeslot.
@@ -234,32 +248,70 @@ impl Renderer714 {
         &mut self,
         frame: &ObjectPcmFrame,
     ) -> Result<(Render714Frame, Vec<Render714TimeslotDebug>), Render714Error> {
+        let samples = frame.samples_per_channel();
+        let mut channels = vec![vec![0.0f32; samples]; RENDER_714_CHANNELS];
         let mut debug = Vec::new();
-        let rendered = self.push_frame_impl(frame, Some(&mut debug))?;
-        Ok((rendered, debug))
+        self.push_frame_parts_impl(
+            &frame.core,
+            &frame.object_channels,
+            frame.oamd.as_ref(),
+            frame.oamd_sample_offset,
+            &mut channels,
+            Some(&mut debug),
+        )?;
+        Ok((
+            Render714Frame {
+                sample_rate: frame.core.sample_rate,
+                channel_order: RENDER_714_CHANNEL_ORDER.to_vec(),
+                channels,
+            },
+            debug,
+        ))
     }
 
-    fn push_frame_impl(
+    pub(crate) fn render_into_channels(
         &mut self,
-        frame: &ObjectPcmFrame,
+        core: &CorePcmFrame,
+        object_channels: &[Vec<f32>],
+        oamd: Option<&OamdPayload>,
+        oamd_sample_offset: Option<u16>,
+        channels: &mut [Vec<f32>],
+    ) -> Result<(), Render714Error> {
+        self.push_frame_parts_impl(
+            core,
+            object_channels,
+            oamd,
+            oamd_sample_offset,
+            channels,
+            None,
+        )
+    }
+
+    fn push_frame_parts_impl(
+        &mut self,
+        core: &CorePcmFrame,
+        object_channels: &[Vec<f32>],
+        oamd: Option<&OamdPayload>,
+        oamd_sample_offset: Option<u16>,
+        channels: &mut [Vec<f32>],
         mut debug: Option<&mut Vec<Render714TimeslotDebug>>,
-    ) -> Result<Render714Frame, Render714Error> {
+    ) -> Result<(), Render714Error> {
         match self.sample_rate {
-            Some(sample_rate) if sample_rate != frame.core.sample_rate => {
+            Some(sample_rate) if sample_rate != core.sample_rate => {
                 return Err(Render714Error::SampleRateChanged {
                     expected: sample_rate,
-                    provided: frame.core.sample_rate,
+                    provided: core.sample_rate,
                 });
             }
             None => {
-                self.sample_rate = Some(frame.core.sample_rate);
-                self.lfe_lowpass = Some(BiquadLowpassState::new(frame.core.sample_rate));
+                self.sample_rate = Some(core.sample_rate);
+                self.lfe_lowpass = Some(BiquadLowpassState::new(core.sample_rate));
             }
             Some(_) => {}
         }
 
-        if let Some(oamd) = frame.oamd.as_ref() {
-            self.metadata.apply_payload(oamd, frame.oamd_sample_offset);
+        if let Some(oamd) = oamd {
+            self.metadata.apply_payload(oamd, oamd_sample_offset);
         } else if !self.metadata.initialized {
             return Err(Render714Error::MissingOamd);
         }
@@ -269,14 +321,14 @@ impl Renderer714 {
         }
 
         let dynamic_object_count = self.metadata.dynamic_object_count();
-        if dynamic_object_count != frame.object_channels.len() {
+        if dynamic_object_count != object_channels.len() {
             return Err(Render714Error::ObjectCountMismatch {
                 expected: dynamic_object_count,
-                provided: frame.object_channels.len(),
+                provided: object_channels.len(),
             });
         }
 
-        let samples = frame.samples_per_channel();
+        let samples = core.samples_per_channel();
         if samples == 0 || samples % RENDER_TIMESLOT_SAMPLES != 0 {
             return Err(Render714Error::UnsupportedSampleCount(samples));
         }
@@ -284,12 +336,12 @@ impl Renderer714 {
             debug_rows.reserve(samples / RENDER_TIMESLOT_SAMPLES);
         }
 
-        let mut channels = vec![vec![0.0f32; samples]; RENDER_714_CHANNELS];
+        prepare_render_channels(channels, samples);
         mix_bed_objects_to_714(
-            &frame.core,
+            core,
             self.metadata.bed_channels(),
             self.metadata.bed_sources(),
-            &mut channels,
+            channels,
         )?;
 
         for timeslot in 0..(samples / RENDER_TIMESLOT_SAMPLES) {
@@ -300,11 +352,11 @@ impl Renderer714 {
             }
             let sample_end = sample_offset + RENDER_TIMESLOT_SAMPLES;
 
-            for (object_index, object_samples) in frame.object_channels.iter().enumerate() {
+            for (object_index, object_samples) in object_channels.iter().enumerate() {
                 let source = &self.metadata.dynamic_sources[object_index];
                 render_object_timeslot_to_714(
                     &object_samples[sample_offset..sample_end],
-                    &mut channels,
+                    channels,
                     sample_offset,
                     source,
                 );
@@ -316,18 +368,10 @@ impl Renderer714 {
         }
 
         if !limiter_disabled() {
-            apply_output_limiter(
-                &mut channels,
-                &mut self.limiter_gain,
-                frame.core.sample_rate,
-            );
+            apply_output_limiter(channels, &mut self.limiter_gain, core.sample_rate);
         }
 
-        Ok(Render714Frame {
-            sample_rate: frame.core.sample_rate,
-            channel_order: RENDER_714_CHANNEL_ORDER.to_vec(),
-            channels,
-        })
+        Ok(())
     }
 
     fn capture_timeslot_debug(&self, sample_offset: usize) -> Render714TimeslotDebug {
@@ -373,6 +417,14 @@ impl Renderer714 {
             sample_offset,
             sources,
         }
+    }
+}
+
+fn prepare_render_channels(channels: &mut [Vec<f32>], samples: usize) {
+    debug_assert_eq!(channels.len(), RENDER_714_CHANNELS);
+    for channel in channels.iter_mut() {
+        channel.resize(samples, 0.0);
+        channel.fill(0.0);
     }
 }
 

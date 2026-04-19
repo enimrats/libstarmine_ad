@@ -1,0 +1,13 @@
+[package]
+name = "libstarmine_ad"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "starmine_ad"
+path = "src/lib.rs"
+crate-type = ["rlib", "staticlib"]
+
+[[bin]]
+name = "starmine-ad-cli"
+path = "src/bin/starmine-ad-cli/main.rs"

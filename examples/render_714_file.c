@@ -1,10 +1,12 @@
 #include <errno.h>
 #include <inttypes.h>
+#include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include <libavcodec/avcodec.h>
 #include <libavcodec/codec_id.h>
@@ -24,6 +26,11 @@ struct wav_writer {
     size_t channel_count;
     uint64_t data_bytes;
     bool initialized;
+};
+
+struct progress_stats {
+    double start_monotonic_seconds;
+    double processed_audio_seconds;
 };
 
 static void usage(const char *argv0) {
@@ -51,6 +58,72 @@ static double ts_to_seconds(int64_t ts, AVRational time_base) {
     if (ts == AV_NOPTS_VALUE)
         return -1.0;
     return ts * av_q2d(time_base);
+}
+
+static double monotonic_seconds(void) {
+    struct timespec ts;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+        return 0.0;
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
+}
+
+static void progress_stats_init(struct progress_stats *stats) {
+    stats->start_monotonic_seconds = monotonic_seconds();
+    stats->processed_audio_seconds = 0.0;
+}
+
+static void progress_stats_add_access_unit(
+    struct progress_stats *stats, const starmine_ad_access_unit_info *info) {
+    if (!stats || !info || info->sample_rate == 0 || info->num_blocks == 0)
+        return;
+
+    stats->processed_audio_seconds +=
+        (256.0 * (double)info->num_blocks) / (double)info->sample_rate;
+}
+
+static void format_media_time(double seconds, char *buffer, size_t buffer_len) {
+    unsigned long long total_centiseconds = 0;
+    unsigned long long hours = 0;
+    unsigned long long minutes = 0;
+    unsigned long long secs = 0;
+    unsigned long long centiseconds = 0;
+
+    if (seconds > 0.0)
+        total_centiseconds = (unsigned long long)llround(seconds * 100.0);
+
+    hours = total_centiseconds / 360000ull;
+    minutes = (total_centiseconds / 6000ull) % 60ull;
+    secs = (total_centiseconds / 100ull) % 60ull;
+    centiseconds = total_centiseconds % 100ull;
+
+    snprintf(buffer, buffer_len, "%02llu:%02llu:%02llu.%02llu", hours, minutes,
+             secs, centiseconds);
+}
+
+static void format_speed(const struct progress_stats *stats, char *buffer,
+                         size_t buffer_len) {
+    double elapsed = 0.0;
+    double speed = 0.0;
+
+    if (!stats) {
+        snprintf(buffer, buffer_len, "N/A");
+        return;
+    }
+
+    elapsed = monotonic_seconds() - stats->start_monotonic_seconds;
+    if (elapsed <= 0.0 || stats->processed_audio_seconds <= 0.0) {
+        snprintf(buffer, buffer_len, "N/A");
+        return;
+    }
+
+    speed = stats->processed_audio_seconds / elapsed;
+    if (!isfinite(speed)) {
+        snprintf(buffer, buffer_len, "N/A");
+        return;
+    }
+
+    snprintf(buffer, buffer_len, "%.2fx", speed);
 }
 
 static const char *bed_channel_name(starmine_ad_bed_channel channel) {
@@ -268,10 +341,13 @@ static bool process_access_unit(starmine_ad_renderer_714 *renderer,
                                 size_t len, int packet_index,
                                 int access_unit_index, int64_t pts,
                                 AVRational time_base, int *rendered_frames,
-                                bool *printed_layout) {
+                                bool *printed_layout,
+                                struct progress_stats *progress) {
     starmine_ad_access_unit_info info;
     starmine_ad_render_714_frame frame;
     starmine_ad_status status;
+    char time_buf[32];
+    char speed_buf[32];
 
     if (starmine_ad_access_unit_info_init(&info) != STARMINE_AD_STATUS_OK ||
         starmine_ad_render_714_frame_init(&frame) != STARMINE_AD_STATUS_OK) {
@@ -289,11 +365,17 @@ static bool process_access_unit(starmine_ad_renderer_714 *renderer,
         return false;
     }
 
-    printf("packet=%d au=%d pts=%.6f frame_size=%u sr=%u joc=%u oamd=%u "
-           "rendered=%u samples=%zu\n",
+    progress_stats_add_access_unit(progress, &info);
+    format_media_time(progress->processed_audio_seconds, time_buf,
+                      sizeof(time_buf));
+    format_speed(progress, speed_buf, sizeof(speed_buf));
+
+    printf("packet=%d au=%d pts=%.6f time=%s speed=%s frame_size=%u sr=%u "
+           "joc=%u oamd=%u rendered=%u samples=%zu\n",
            packet_index, access_unit_index, ts_to_seconds(pts, time_base),
-           info.frame_size, info.sample_rate, info.joc_payload_count,
-           info.oamd_payload_count, frame.has_frame, frame.samples_per_channel);
+           time_buf, speed_buf, info.frame_size, info.sample_rate,
+           info.joc_payload_count, info.oamd_payload_count, frame.has_frame,
+           frame.samples_per_channel);
 
     if (frame.has_frame && !*printed_layout) {
         print_channel_order(&frame);
@@ -319,6 +401,7 @@ int main(int argc, char **argv) {
     const AVCodec *codec = NULL;
     starmine_ad_renderer_714 *renderer = NULL;
     struct wav_writer writer;
+    struct progress_stats progress;
     int stream_index = -1;
     int limit = -1;
     int packet_index = 0;
@@ -328,6 +411,7 @@ int main(int argc, char **argv) {
     bool printed_layout = false;
 
     memset(&writer, 0, sizeof(writer));
+    progress_stats_init(&progress);
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--stream-index") == 0) {
@@ -464,7 +548,7 @@ int main(int argc, char **argv) {
                                          (size_t)access_unit_size, packet_index,
                                          access_unit_index, pkt->pts,
                                          stream->time_base, &rendered_frames,
-                                         &printed_layout)) {
+                                         &printed_layout, &progress)) {
                     av_packet_unref(pkt);
                     goto done;
                 }
@@ -504,7 +588,8 @@ int main(int argc, char **argv) {
                                  (size_t)access_unit_size, packet_index,
                                  access_unit_index, AV_NOPTS_VALUE,
                                  fmt->streams[stream_index]->time_base,
-                                 &rendered_frames, &printed_layout)) {
+                                 &rendered_frames, &printed_layout,
+                                 &progress)) {
             goto done;
         }
         access_unit_index++;
@@ -516,8 +601,15 @@ finalize:
     if (!wav_writer_finalize(&writer))
         goto done;
 
-    printf("access_units=%d rendered_frames=%d output=%s\n", access_unit_index,
-           rendered_frames, output);
+    {
+        char time_buf[32];
+        char speed_buf[32];
+        format_media_time(progress.processed_audio_seconds, time_buf,
+                          sizeof(time_buf));
+        format_speed(&progress, speed_buf, sizeof(speed_buf));
+        printf("access_units=%d rendered_frames=%d time=%s speed=%s output=%s\n",
+               access_unit_index, rendered_frames, time_buf, speed_buf, output);
+    }
     if (rendered_frames == 0) {
         printf("no 7.1.4 frames were produced\n");
     }

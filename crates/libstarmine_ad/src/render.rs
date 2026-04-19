@@ -331,8 +331,9 @@ impl Renderer714 {
     }
 
     fn capture_timeslot_debug(&self, sample_offset: usize) -> Render714TimeslotDebug {
-        let mut sources =
-            Vec::with_capacity(self.metadata.bed_sources.len() + self.metadata.dynamic_sources.len());
+        let mut sources = Vec::with_capacity(
+            self.metadata.bed_sources.len() + self.metadata.dynamic_sources.len(),
+        );
 
         for (object_index, (channel, source)) in self
             .metadata
@@ -1293,11 +1294,7 @@ fn fix_incomplete_layer(
 }
 
 fn ratio(a: f32, b: f32, x: f32) -> f32 {
-    if a == b {
-        0.0
-    } else {
-        (x - a) / (b - a)
-    }
+    if a == b { 0.0 } else { (x - a) / (b - a) }
 }
 
 fn apply_output_limiter(channels: &mut [Vec<f32>], last_gain: &mut f32, sample_rate: u32) {

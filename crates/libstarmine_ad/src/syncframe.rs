@@ -2125,7 +2125,11 @@ pub(crate) fn decode_core_pcm_frame_with_state(
     let frame_samples = info.num_blocks as usize * 256;
     let mut fullband_channels = vec![vec![0.0f32; frame_samples]; info.fullband_channels as usize];
     let mut lfe_channel = info.lfe_on.then(|| vec![0.0f32; frame_samples]);
-    state.reconfigure(info.fullband_channels as usize, info.lfe_on, sample_rate_index);
+    state.reconfigure(
+        info.fullband_channels as usize,
+        info.lfe_on,
+        sample_rate_index,
+    );
     let CoreDecodeState {
         block_syntax,
         imdct,

@@ -509,26 +509,31 @@ mod tests {
             }),
         };
 
-        let mut mix_matrix = [
-            vec![[1.0; 64]; 5],
-            vec![[2.0; 64]; 5],
-        ];
+        let mut mix_matrix = [vec![[1.0; 64]; 5], vec![[2.0; 64]; 5]];
         let mut timeslot_offsets = [0; 2];
         decode_parameter_points(&mut mix_matrix, &mut timeslot_offsets, &object, 5)
             .expect("points");
 
-        assert!(mix_matrix[0]
-            .iter()
-            .all(|channel| channel[..3].iter().all(|value| *value == 0.0)));
-        assert!(mix_matrix[0]
-            .iter()
-            .all(|channel| channel[3..].iter().all(|value| *value == 1.0)));
-        assert!(mix_matrix[1]
-            .iter()
-            .all(|channel| channel[..3].iter().all(|value| *value == 0.0)));
-        assert!(mix_matrix[1]
-            .iter()
-            .all(|channel| channel[3..].iter().all(|value| *value == 2.0)));
+        assert!(
+            mix_matrix[0]
+                .iter()
+                .all(|channel| channel[..3].iter().all(|value| *value == 0.0))
+        );
+        assert!(
+            mix_matrix[0]
+                .iter()
+                .all(|channel| channel[3..].iter().all(|value| *value == 1.0))
+        );
+        assert!(
+            mix_matrix[1]
+                .iter()
+                .all(|channel| channel[..3].iter().all(|value| *value == 0.0))
+        );
+        assert!(
+            mix_matrix[1]
+                .iter()
+                .all(|channel| channel[3..].iter().all(|value| *value == 2.0))
+        );
     }
 
     #[test]
@@ -567,9 +572,11 @@ mod tests {
         assert!(output[2][0].iter().all(|value| *value == 0.0));
         assert!(output[3][0].iter().all(|value| *value == 0.0));
         assert!(output[1][0].iter().all(|value| *value == 0.0));
-        assert!(prev_matrix[0]
-            .iter()
-            .all(|value| (*value - 0.2).abs() < 1e-6));
+        assert!(
+            prev_matrix[0]
+                .iter()
+                .all(|value| (*value - 0.2).abs() < 1e-6)
+        );
     }
 
     #[test]

@@ -1,44 +1,7 @@
 use std::f32::consts::PI;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
-#[derive(Debug, Clone, Copy, Default)]
-struct Complex32 {
-    re: f32,
-    im: f32,
-}
-
-impl Complex32 {
-    const fn new(re: f32, im: f32) -> Self {
-        Self { re, im }
-    }
-}
-
-impl std::ops::Add for Complex32 {
-    type Output = Self;
-
-    fn add(self, rhs: Self) -> Self::Output {
-        Self::new(self.re + rhs.re, self.im + rhs.im)
-    }
-}
-
-impl std::ops::Sub for Complex32 {
-    type Output = Self;
-
-    fn sub(self, rhs: Self) -> Self::Output {
-        Self::new(self.re - rhs.re, self.im - rhs.im)
-    }
-}
-
-impl std::ops::Mul for Complex32 {
-    type Output = Self;
-
-    fn mul(self, rhs: Self) -> Self::Output {
-        Self::new(
-            self.re * rhs.re - self.im * rhs.im,
-            self.re * rhs.im + self.im * rhs.re,
-        )
-    }
-}
+use rustfft::{Fft, FftPlanner, num_complex::Complex32};
 
 #[derive(Debug, Clone)]
 pub(crate) struct ImdctState {
@@ -78,7 +41,9 @@ impl ImdctState {
         for (index, slot) in self.intermediate_512.iter_mut().enumerate() {
             *slot = Complex32::new(coeffs[255 - 2 * index], coeffs[2 * index]) * x[index];
         }
-        ifft_unscaled(&mut self.intermediate_512);
+        imdct_fft_cache()
+            .ifft_512
+            .process(&mut self.intermediate_512);
         for (value, coeff) in self.intermediate_512.iter_mut().zip(x.iter().copied()) {
             *value = *value * coeff;
         }
@@ -110,22 +75,13 @@ impl ImdctState {
     }
 
     fn apply_256(&mut self, coeffs: &[f32; 256], output: &mut [f32]) {
-        for index in 0..128 {
-            self.coeff_split1[index] = coeffs[2 * index];
-            self.coeff_split2[index] = coeffs[2 * index + 1];
-        }
+        self.split_256_coefficients(coeffs);
+        self.prepare_256_intermediates();
 
+        let fft = imdct_fft_cache();
+        fft.ifft_256.process(&mut self.intermediate_256_a);
+        fft.ifft_256.process(&mut self.intermediate_256_b);
         let x = x256();
-        for (index, slot) in self.intermediate_256_a.iter_mut().enumerate() {
-            *slot =
-                Complex32::new(self.coeff_split1[127 - 2 * index], coeffs[2 * index]) * x[index];
-        }
-        for (index, slot) in self.intermediate_256_b.iter_mut().enumerate() {
-            *slot =
-                Complex32::new(self.coeff_split2[127 - 2 * index], coeffs[2 * index]) * x[index];
-        }
-        ifft_unscaled(&mut self.intermediate_256_a);
-        ifft_unscaled(&mut self.intermediate_256_b);
         for (value, coeff) in self.intermediate_256_a.iter_mut().zip(x.iter().copied()) {
             *value = *value * coeff;
         }
@@ -159,41 +115,42 @@ impl ImdctState {
         }
         self.delay.copy_from_slice(&self.output[256..512]);
     }
+
+    fn split_256_coefficients(&mut self, coeffs: &[f32; 256]) {
+        for index in 0..128 {
+            self.coeff_split1[index] = coeffs[2 * index];
+            self.coeff_split2[index] = coeffs[2 * index + 1];
+        }
+    }
+
+    fn prepare_256_intermediates(&mut self) {
+        let x = x256();
+        for (index, slot) in self.intermediate_256_a.iter_mut().enumerate() {
+            *slot = Complex32::new(self.coeff_split1[127 - 2 * index], self.coeff_split1[index])
+                * x[index];
+        }
+        // https://github.com/FFmpeg/FFmpeg/blob/415b466d41ac81856abc76d7a9341132b0f668b0/libavcodec/ac3dec.c#L587
+        for (index, slot) in self.intermediate_256_b.iter_mut().enumerate() {
+            *slot = Complex32::new(self.coeff_split2[127 - 2 * index], self.coeff_split2[index])
+                * x[index];
+        }
+    }
 }
 
-fn ifft_unscaled(buffer: &mut [Complex32]) {
-    let len = buffer.len();
-    debug_assert!(len.is_power_of_two());
+struct ImdctFftCache {
+    ifft_512: Arc<dyn Fft<f32>>,
+    ifft_256: Arc<dyn Fft<f32>>,
+}
 
-    let mut reversed = 0usize;
-    for index in 1..len {
-        let mut bit = len >> 1;
-        while reversed & bit != 0 {
-            reversed &= !bit;
-            bit >>= 1;
+fn imdct_fft_cache() -> &'static ImdctFftCache {
+    static CACHE: OnceLock<ImdctFftCache> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        let mut planner = FftPlanner::<f32>::new();
+        ImdctFftCache {
+            ifft_512: planner.plan_fft_inverse(128),
+            ifft_256: planner.plan_fft_inverse(64),
         }
-        reversed |= bit;
-        if index < reversed {
-            buffer.swap(index, reversed);
-        }
-    }
-
-    let mut stage = 2usize;
-    while stage <= len {
-        let half = stage >> 1;
-        let step = 2.0 * PI / stage as f32;
-        for base in (0..len).step_by(stage) {
-            for index in 0..half {
-                let angle = step * index as f32;
-                let twiddle = Complex32::new(angle.cos(), angle.sin());
-                let even = buffer[base + index];
-                let odd = buffer[base + index + half] * twiddle;
-                buffer[base + index] = even + odd;
-                buffer[base + index + half] = even - odd;
-            }
-        }
-        stage <<= 1;
-    }
+    })
 }
 
 fn x512() -> &'static [Complex32; 128] {
@@ -248,7 +205,7 @@ const WINDOW: [f32; 256] = [
 
 #[cfg(test)]
 mod tests {
-    use super::ImdctState;
+    use super::{Complex32, ImdctState, x256};
 
     #[test]
     fn zero_coefficients_decode_to_silence() {
@@ -261,5 +218,22 @@ mod tests {
 
         state.apply(&coeffs, true, &mut output);
         assert!(output.iter().all(|sample| *sample == 0.0));
+    }
+
+    #[test]
+    fn short_block_second_pre_ifft_uses_odd_coefficients() {
+        let mut state = ImdctState::new();
+        let mut coeffs = [0.0f32; 256];
+        coeffs[0] = 2.0;
+        coeffs[1] = 3.0;
+        coeffs[255] = 5.0;
+
+        state.split_256_coefficients(&coeffs);
+        state.prepare_256_intermediates();
+
+        let sample = state.intermediate_256_b[0];
+        let expected = Complex32::new(5.0, 3.0) * x256()[0];
+        assert!((sample.re - expected.re).abs() < 1e-6);
+        assert!((sample.im - expected.im).abs() < 1e-6);
     }
 }

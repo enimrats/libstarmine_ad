@@ -22,29 +22,29 @@ impl QmfSubbands {
 #[derive(Debug, Clone)]
 pub(crate) struct QuadratureMirrorFilterBank {
     input_stream_forward: [f32; QMF_COEFFS_LEN],
+    input_stream_forward_head: usize,
     input_stream_inverse: [f32; QMF_COEFFS_LEN * 2],
+    input_stream_inverse_head: usize,
 }
 
 impl QuadratureMirrorFilterBank {
     pub fn new() -> Self {
         Self {
             input_stream_forward: [0.0; QMF_COEFFS_LEN],
+            input_stream_forward_head: 0,
             input_stream_inverse: [0.0; QMF_COEFFS_LEN * 2],
+            input_stream_inverse_head: 0,
         }
     }
 
     pub fn process_forward(&mut self, input: &[f32]) -> QmfSubbands {
         debug_assert_eq!(input.len(), QMF_SUBBANDS);
 
-        self.input_stream_forward
-            .copy_within(0..QMF_COEFFS_LEN - QMF_SUBBANDS, QMF_SUBBANDS);
-        for (slot, sample) in self
-            .input_stream_forward
-            .iter_mut()
-            .take(QMF_SUBBANDS)
-            .zip(input.iter().rev())
-        {
-            *slot = *sample;
+        self.input_stream_forward_head =
+            wrap_ring_head(self.input_stream_forward_head, QMF_SUBBANDS, QMF_COEFFS_LEN);
+        for (offset, sample) in input.iter().rev().enumerate() {
+            let slot = ring_index(self.input_stream_forward_head, offset, QMF_COEFFS_LEN);
+            self.input_stream_forward[slot] = *sample;
         }
 
         let mut grouping = [0.0f32; QMF_DOUBLE_LENGTH];
@@ -52,7 +52,9 @@ impl QuadratureMirrorFilterBank {
             let mut sum = 0.0f32;
             let mut source = sample;
             while source < QMF_COEFFS_LEN {
-                sum += self.input_stream_forward[source] * QMF_COEFFS[source];
+                sum += self.input_stream_forward
+                    [ring_index(self.input_stream_forward_head, source, QMF_COEFFS_LEN)]
+                    * QMF_COEFFS[source];
                 source += QMF_DOUBLE_LENGTH;
             }
             *slot = sum;
@@ -71,8 +73,11 @@ impl QuadratureMirrorFilterBank {
         debug_assert_eq!(output.len(), QMF_SUBBANDS);
 
         let inverse_len = self.input_stream_inverse.len();
-        self.input_stream_inverse
-            .copy_within(0..inverse_len - QMF_DOUBLE_LENGTH, QMF_DOUBLE_LENGTH);
+        self.input_stream_inverse_head = wrap_ring_head(
+            self.input_stream_inverse_head,
+            QMF_DOUBLE_LENGTH,
+            inverse_len,
+        );
 
         let cache = qmf_cache();
         for sample in 0..QMF_DOUBLE_LENGTH {
@@ -81,14 +86,20 @@ impl QuadratureMirrorFilterBank {
                 value += cache.inverse_real[subband][sample] * input.real[subband];
                 value -= cache.inverse_imaginary[subband][sample] * input.imaginary[subband];
             }
-            self.input_stream_inverse[sample] = value;
+            let slot = ring_index(self.input_stream_inverse_head, sample, inverse_len);
+            self.input_stream_inverse[slot] = value;
         }
 
         output.fill(0.0);
         for sample in 0..QMF_SUBBANDS {
-            output[sample] = self.input_stream_inverse[sample] * QMF_COEFFS[sample]
-                + self.input_stream_inverse[QMF_SUBBANDS * 3 + sample]
-                    * QMF_COEFFS[QMF_SUBBANDS + sample];
+            output[sample] = self.input_stream_inverse
+                [ring_index(self.input_stream_inverse_head, sample, inverse_len)]
+                * QMF_COEFFS[sample]
+                + self.input_stream_inverse[ring_index(
+                    self.input_stream_inverse_head,
+                    QMF_SUBBANDS * 3 + sample,
+                    inverse_len,
+                )] * QMF_COEFFS[QMF_SUBBANDS + sample];
         }
         for group in 1..(QMF_COEFFS_LEN / QMF_DOUBLE_LENGTH) {
             let time_slot = QMF_SUBBANDS * 4 * group;
@@ -96,10 +107,16 @@ impl QuadratureMirrorFilterBank {
             let time_pair = time_slot + QMF_SUBBANDS * 3;
             let coeff_pair = coeff_slot + QMF_SUBBANDS;
             for sample in 0..QMF_SUBBANDS {
-                output[sample] += self.input_stream_inverse[time_slot + sample]
-                    * QMF_COEFFS[coeff_slot + sample]
-                    + self.input_stream_inverse[time_pair + sample]
-                        * QMF_COEFFS[coeff_pair + sample];
+                output[sample] += self.input_stream_inverse[ring_index(
+                    self.input_stream_inverse_head,
+                    time_slot + sample,
+                    inverse_len,
+                )] * QMF_COEFFS[coeff_slot + sample]
+                    + self.input_stream_inverse[ring_index(
+                        self.input_stream_inverse_head,
+                        time_pair + sample,
+                        inverse_len,
+                    )] * QMF_COEFFS[coeff_pair + sample];
             }
         }
     }
@@ -117,6 +134,21 @@ fn dot(lhs: &[f32; QMF_DOUBLE_LENGTH], rhs: &[f32; QMF_DOUBLE_LENGTH]) -> f32 {
         sum += lhs[index] * rhs[index];
     }
     sum
+}
+
+#[inline]
+fn wrap_ring_head(head: usize, step: usize, len: usize) -> usize {
+    if head >= step {
+        head - step
+    } else {
+        len + head - step
+    }
+}
+
+#[inline]
+fn ring_index(head: usize, offset: usize, len: usize) -> usize {
+    let index = head + offset;
+    if index >= len { index - len } else { index }
 }
 
 struct QmfCache {
@@ -155,6 +187,175 @@ fn qmf_cache() -> &'static QmfCache {
         }
         cache
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct ReferenceQmfBank {
+        input_stream_forward: [f32; QMF_COEFFS_LEN],
+        input_stream_inverse: [f32; QMF_COEFFS_LEN * 2],
+    }
+
+    impl ReferenceQmfBank {
+        fn new() -> Self {
+            Self {
+                input_stream_forward: [0.0; QMF_COEFFS_LEN],
+                input_stream_inverse: [0.0; QMF_COEFFS_LEN * 2],
+            }
+        }
+
+        fn process_forward(&mut self, input: &[f32]) -> QmfSubbands {
+            self.input_stream_forward
+                .copy_within(0..QMF_COEFFS_LEN - QMF_SUBBANDS, QMF_SUBBANDS);
+            for (slot, sample) in self
+                .input_stream_forward
+                .iter_mut()
+                .take(QMF_SUBBANDS)
+                .zip(input.iter().rev())
+            {
+                *slot = *sample;
+            }
+
+            let mut grouping = [0.0f32; QMF_DOUBLE_LENGTH];
+            for (sample, slot) in grouping.iter_mut().enumerate() {
+                let mut sum = 0.0f32;
+                let mut source = sample;
+                while source < QMF_COEFFS_LEN {
+                    sum += self.input_stream_forward[source] * QMF_COEFFS[source];
+                    source += QMF_DOUBLE_LENGTH;
+                }
+                *slot = sum;
+            }
+
+            let cache = qmf_cache();
+            let mut result = QmfSubbands::zero();
+            for subband in 0..QMF_SUBBANDS {
+                result.real[subband] = dot(&cache.forward_real[subband], &grouping);
+                result.imaginary[subband] = dot(&cache.forward_imaginary[subband], &grouping);
+            }
+            result
+        }
+
+        fn process_inverse(&mut self, input: &QmfSubbands, output: &mut [f32]) {
+            let inverse_len = self.input_stream_inverse.len();
+            self.input_stream_inverse
+                .copy_within(0..inverse_len - QMF_DOUBLE_LENGTH, QMF_DOUBLE_LENGTH);
+
+            let cache = qmf_cache();
+            for sample in 0..QMF_DOUBLE_LENGTH {
+                let mut value = 0.0f32;
+                for subband in 0..QMF_SUBBANDS {
+                    value += cache.inverse_real[subband][sample] * input.real[subband];
+                    value -= cache.inverse_imaginary[subband][sample] * input.imaginary[subband];
+                }
+                self.input_stream_inverse[sample] = value;
+            }
+
+            output.fill(0.0);
+            for sample in 0..QMF_SUBBANDS {
+                output[sample] = self.input_stream_inverse[sample] * QMF_COEFFS[sample]
+                    + self.input_stream_inverse[QMF_SUBBANDS * 3 + sample]
+                        * QMF_COEFFS[QMF_SUBBANDS + sample];
+            }
+            for group in 1..(QMF_COEFFS_LEN / QMF_DOUBLE_LENGTH) {
+                let time_slot = QMF_SUBBANDS * 4 * group;
+                let coeff_slot = QMF_DOUBLE_LENGTH * group;
+                let time_pair = time_slot + QMF_SUBBANDS * 3;
+                let coeff_pair = coeff_slot + QMF_SUBBANDS;
+                for sample in 0..QMF_SUBBANDS {
+                    output[sample] += self.input_stream_inverse[time_slot + sample]
+                        * QMF_COEFFS[coeff_slot + sample]
+                        + self.input_stream_inverse[time_pair + sample]
+                            * QMF_COEFFS[coeff_pair + sample];
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn forward_ring_buffer_matches_copy_within_reference() {
+        let mut actual = QuadratureMirrorFilterBank::new();
+        let mut reference = ReferenceQmfBank::new();
+        let mut seed = 0x1234_5678;
+
+        for _ in 0..64 {
+            let input = next_block(&mut seed);
+            let actual_subbands = actual.process_forward(&input);
+            let reference_subbands = reference.process_forward(&input);
+            assert_subbands_close(&actual_subbands, &reference_subbands);
+        }
+    }
+
+    #[test]
+    fn inverse_ring_buffer_matches_copy_within_reference() {
+        let mut actual = QuadratureMirrorFilterBank::new();
+        let mut reference = ReferenceQmfBank::new();
+        let mut seed = 0x8765_4321;
+
+        for _ in 0..64 {
+            let input = next_subbands(&mut seed);
+            let mut actual_output = [0.0f32; QMF_SUBBANDS];
+            let mut reference_output = [0.0f32; QMF_SUBBANDS];
+            actual.process_inverse(&input, &mut actual_output);
+            reference.process_inverse(&input, &mut reference_output);
+            assert_output_close(&actual_output, &reference_output);
+        }
+    }
+
+    fn next_block(seed: &mut u32) -> [f32; QMF_SUBBANDS] {
+        let mut output = [0.0f32; QMF_SUBBANDS];
+        for sample in &mut output {
+            *sample = next_sample(seed);
+        }
+        output
+    }
+
+    fn next_subbands(seed: &mut u32) -> QmfSubbands {
+        let mut output = QmfSubbands::zero();
+        for sample in &mut output.real {
+            *sample = next_sample(seed);
+        }
+        for sample in &mut output.imaginary {
+            *sample = next_sample(seed);
+        }
+        output
+    }
+
+    fn next_sample(seed: &mut u32) -> f32 {
+        *seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        let normalized = (*seed >> 8) as f32 / ((1u32 << 24) as f32);
+        normalized * 2.0 - 1.0
+    }
+
+    fn assert_subbands_close(actual: &QmfSubbands, expected: &QmfSubbands) {
+        for index in 0..QMF_SUBBANDS {
+            assert!(
+                (actual.real[index] - expected.real[index]).abs() <= f32::EPSILON,
+                "real[{index}] mismatch: {} vs {}",
+                actual.real[index],
+                expected.real[index],
+            );
+            assert!(
+                (actual.imaginary[index] - expected.imaginary[index]).abs() <= f32::EPSILON,
+                "imaginary[{index}] mismatch: {} vs {}",
+                actual.imaginary[index],
+                expected.imaginary[index],
+            );
+        }
+    }
+
+    fn assert_output_close(actual: &[f32; QMF_SUBBANDS], expected: &[f32; QMF_SUBBANDS]) {
+        for index in 0..QMF_SUBBANDS {
+            assert!(
+                (actual[index] - expected[index]).abs() <= f32::EPSILON,
+                "output[{index}] mismatch: {} vs {}",
+                actual[index],
+                expected[index],
+            );
+        }
+    }
 }
 
 const QMF_COEFFS: [f32; QMF_COEFFS_LEN] = [

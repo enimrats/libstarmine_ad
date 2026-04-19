@@ -3,6 +3,9 @@ name = "libstarmine_ad"
 version = "0.1.0"
 edition = "2024"
 
+[dependencies]
+rustfft = "6.4"
+
 [lib]
 name = "starmine_ad"
 path = "src/lib.rs"

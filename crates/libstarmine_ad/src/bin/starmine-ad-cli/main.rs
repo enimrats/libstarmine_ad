@@ -5,11 +5,12 @@ use std::fs::{self, File};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Instant;
 
 use raw_eac3::RawEac3FrameIter;
 use starmine_ad::{
-    BedChannel, CorePcmFrame, Decoder, JocObjectMatrices, ObjectPcmDecoder, ObjectPcmFrame, PcmDecoder,
-    RENDER_714_CHANNEL_ORDER, Render714Frame, Render714TimeslotDebug, Renderer714,
+    BedChannel, CorePcmFrame, Decoder, JocObjectMatrices, ObjectPcmDecoder, ObjectPcmFrame,
+    PcmDecoder, RENDER_714_CHANNEL_ORDER, Render714Frame, Render714TimeslotDebug, Renderer714,
 };
 
 #[derive(Debug, Clone)]
@@ -63,6 +64,61 @@ struct RenderPositionsCsvWriter {
     path: PathBuf,
     file: File,
     timeslots_written: usize,
+}
+
+struct ProgressStats {
+    started_at: Instant,
+    processed_audio_seconds: f64,
+}
+
+impl ProgressStats {
+    fn new() -> Self {
+        Self {
+            started_at: Instant::now(),
+            processed_audio_seconds: 0.0,
+        }
+    }
+
+    fn record_access_unit(&mut self, sample_rate: u32, num_blocks: u8) {
+        if sample_rate == 0 || num_blocks == 0 {
+            return;
+        }
+
+        self.processed_audio_seconds +=
+            (usize::from(num_blocks) * 256) as f64 / f64::from(sample_rate);
+    }
+
+    fn format_status(&self) -> String {
+        let elapsed = self.started_at.elapsed().as_secs_f64();
+        let speed = if elapsed > 0.0 && self.processed_audio_seconds > 0.0 {
+            Some(self.processed_audio_seconds / elapsed)
+        } else {
+            None
+        };
+
+        format!(
+            "time={} speed={}",
+            format_media_time(self.processed_audio_seconds),
+            format_speed(speed),
+        )
+    }
+}
+
+fn format_media_time(seconds: f64) -> String {
+    let total_centiseconds = (seconds.max(0.0) * 100.0).round() as u64;
+    let hours = total_centiseconds / 360_000;
+    let minutes = (total_centiseconds / 6_000) % 60;
+    let secs = (total_centiseconds / 100) % 60;
+    let centiseconds = total_centiseconds % 100;
+
+    format!("{hours:02}:{minutes:02}:{secs:02}.{centiseconds:02}")
+}
+
+fn format_speed(speed: Option<f64>) -> String {
+    match speed {
+        Some(speed) if speed.is_finite() => format!("{speed:.2}x"),
+        _ => "N/A".to_string(),
+    }
 }
 
 impl CoreDumpWriter {
@@ -332,7 +388,9 @@ impl JocMatrixDumpWriter {
 
     fn ensure_files(&mut self, object_count: usize) -> Result<(), String> {
         while self.files.len() < object_count {
-            let path = self.path.join(format!("obj{:03}.mix.f32", self.files.len()));
+            let path = self
+                .path
+                .join(format!("obj{:03}.mix.f32", self.files.len()));
             let file = File::create(&path)
                 .map_err(|err| format!("failed to create {}: {err}", path.display()))?;
             self.files.push(file);
@@ -498,8 +556,14 @@ impl RenderPositionsCsvWriter {
         timeslots: &[Render714TimeslotDebug],
     ) -> Result<Option<String>, String> {
         let first_summary = if self.timeslots_written == 0 {
-            let object_count = timeslots.first().map(|timeslot| timeslot.sources.len()).unwrap_or(0);
-            Some(format!("timeslots={} objects={object_count}", timeslots.len()))
+            let object_count = timeslots
+                .first()
+                .map(|timeslot| timeslot.sources.len())
+                .unwrap_or(0);
+            Some(format!(
+                "timeslots={} objects={object_count}",
+                timeslots.len()
+            ))
         } else {
             None
         };
@@ -512,10 +576,7 @@ impl RenderPositionsCsvWriter {
                     self.file,
                     "{global_timeslot},{global_sample_offset},{},{},{},{},{},{},{},{},{}",
                     source.object_index,
-                    source
-                        .static_channel
-                        .map(bed_channel_name)
-                        .unwrap_or(""),
+                    source.static_channel.map(bed_channel_name).unwrap_or(""),
                     source.position.x,
                     source.position.y,
                     source.position.z,
@@ -712,11 +773,10 @@ fn process_raw_eac3(input: &Path, bytes: &[u8], options: &RunOptions) -> ExitCod
     let use_render_714 = options.render_714_check
         || options.dump_render_714_wav.is_some()
         || options.dump_render_positions_csv.is_some();
-    let use_object_pcm =
-        options.decode_objects_check
-            || options.dump_objects_f32.is_some()
-            || options.dump_joc_matrices_f32.is_some()
-            || use_render_714;
+    let use_object_pcm = options.decode_objects_check
+        || options.dump_objects_f32.is_some()
+        || options.dump_joc_matrices_f32.is_some()
+        || use_render_714;
     let use_core_pcm = options.decode_core_check || options.dump_core_f32.is_some();
     let mut summary_decoder = Decoder::new();
     let mut pcm_decoder = PcmDecoder::new();
@@ -773,6 +833,7 @@ fn process_raw_eac3(input: &Path, bytes: &[u8], options: &RunOptions) -> ExitCod
         None => None,
     };
     let mut frames = 0usize;
+    let mut progress = ProgressStats::new();
 
     println!(
         "input={} mode=raw-eac3 bytes={} limit={} dump_frame_dir={} dump_aux_dir={} decode_core={} dump_core_f32={} decode_objects={} dump_objects_f32={} dump_joc_matrices_f32={} render_714={} dump_render_714_wav={} dump_render_positions_csv={}",
@@ -865,12 +926,15 @@ fn process_raw_eac3(input: &Path, bytes: &[u8], options: &RunOptions) -> ExitCod
             } else {
                 (None, None)
             };
+            progress.record_access_unit(result.info.sample_rate, result.info.num_blocks);
+            let progress_status = progress.format_status();
 
             println!(
-                "frame={} offset={} frames_seen={} {} corepcm={}s/{}ch objectpcm={}obj/{}active/{}sparse{}",
+                "frame={} offset={} frames_seen={} {} {} corepcm={}s/{}ch objectpcm={}obj/{}active/{}sparse{}",
                 frames,
                 frame.offset,
                 result.frames_seen,
+                progress_status,
                 result.info.summary(),
                 result.pcm.core.samples_per_channel(),
                 result.pcm.core.total_channels(),
@@ -1001,12 +1065,15 @@ fn process_raw_eac3(input: &Path, bytes: &[u8], options: &RunOptions) -> ExitCod
                     return ExitCode::FAILURE;
                 }
             };
+            progress.record_access_unit(result.info.sample_rate, result.info.num_blocks);
+            let progress_status = progress.format_status();
 
             println!(
-                "frame={} offset={} frames_seen={} {} corepcm={}s/{}ch",
+                "frame={} offset={} frames_seen={} {} {} corepcm={}s/{}ch",
                 frames,
                 frame.offset,
                 result.frames_seen,
+                progress_status,
                 result.info.summary(),
                 result.pcm.samples_per_channel(),
                 result.pcm.total_channels(),
@@ -1050,12 +1117,15 @@ fn process_raw_eac3(input: &Path, bytes: &[u8], options: &RunOptions) -> ExitCod
                     return ExitCode::FAILURE;
                 }
             };
+            progress.record_access_unit(result.info.sample_rate, result.info.num_blocks);
+            let progress_status = progress.format_status();
 
             println!(
-                "frame={} offset={} frames_seen={} {}",
+                "frame={} offset={} frames_seen={} {} {}",
                 frames,
                 frame.offset,
                 result.frames_seen,
+                progress_status,
                 result.info.summary(),
             );
 
@@ -1088,7 +1158,7 @@ fn process_raw_eac3(input: &Path, bytes: &[u8], options: &RunOptions) -> ExitCod
         }
     }
 
-    println!("frames_dumped={frames}");
+    println!("frames_dumped={} {}", frames, progress.format_status());
     ExitCode::SUCCESS
 }
 
@@ -1101,11 +1171,10 @@ fn process_frame_dir(input_dir: &Path, options: &RunOptions) -> ExitCode {
         }
     };
     let use_render_714 = options.render_714_check || options.dump_render_714_wav.is_some();
-    let use_object_pcm =
-        options.decode_objects_check
-            || options.dump_objects_f32.is_some()
-            || options.dump_joc_matrices_f32.is_some()
-            || use_render_714;
+    let use_object_pcm = options.decode_objects_check
+        || options.dump_objects_f32.is_some()
+        || options.dump_joc_matrices_f32.is_some()
+        || use_render_714;
     let use_core_pcm = options.decode_core_check || options.dump_core_f32.is_some();
     let mut summary_decoder = Decoder::new();
     let mut pcm_decoder = PcmDecoder::new();
@@ -1152,6 +1221,7 @@ fn process_frame_dir(input_dir: &Path, options: &RunOptions) -> ExitCode {
         None => None,
     };
     let mut frames = 0usize;
+    let mut progress = ProgressStats::new();
 
     println!(
         "input={} mode=frame-dir files={} limit={} dump_aux_dir={} decode_core={} dump_core_f32={} decode_objects={} dump_objects_f32={} dump_joc_matrices_f32={} render_714={} dump_render_714_wav={}",
@@ -1224,12 +1294,15 @@ fn process_frame_dir(input_dir: &Path, options: &RunOptions) -> ExitCode {
             } else {
                 None
             };
+            progress.record_access_unit(result.info.sample_rate, result.info.num_blocks);
+            let progress_status = progress.format_status();
 
             println!(
-                "frame={} source={} frames_seen={} {} corepcm={}s/{}ch objectpcm={}obj/{}active/{}sparse{}",
+                "frame={} source={} frames_seen={} {} {} corepcm={}s/{}ch objectpcm={}obj/{}active/{}sparse{}",
                 frames,
                 path.display(),
                 result.frames_seen,
+                progress_status,
                 result.info.summary(),
                 result.pcm.core.samples_per_channel(),
                 result.pcm.core.total_channels(),
@@ -1336,12 +1409,15 @@ fn process_frame_dir(input_dir: &Path, options: &RunOptions) -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
+            progress.record_access_unit(result.info.sample_rate, result.info.num_blocks);
+            let progress_status = progress.format_status();
 
             println!(
-                "frame={} source={} frames_seen={} {} corepcm={}s/{}ch",
+                "frame={} source={} frames_seen={} {} {} corepcm={}s/{}ch",
                 frames,
                 path.display(),
                 result.frames_seen,
+                progress_status,
                 result.info.summary(),
                 result.pcm.samples_per_channel(),
                 result.pcm.total_channels(),
@@ -1379,12 +1455,15 @@ fn process_frame_dir(input_dir: &Path, options: &RunOptions) -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
+            progress.record_access_unit(result.info.sample_rate, result.info.num_blocks);
+            let progress_status = progress.format_status();
 
             println!(
-                "frame={} source={} frames_seen={} {}",
+                "frame={} source={} frames_seen={} {} {}",
                 frames,
                 path.display(),
                 result.frames_seen,
+                progress_status,
                 result.info.summary(),
             );
 
@@ -1411,7 +1490,7 @@ fn process_frame_dir(input_dir: &Path, options: &RunOptions) -> ExitCode {
         }
     }
 
-    println!("frames_dumped={frames}");
+    println!("frames_dumped={} {}", frames, progress.format_status());
     ExitCode::SUCCESS
 }
 

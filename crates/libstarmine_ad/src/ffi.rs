@@ -5,11 +5,12 @@ use std::slice;
 use crate::joc::JocObjectDecoderState;
 use crate::metadata::{BedChannel, MetadataParseState, ParsedEmdfPayloadData};
 use crate::syncframe::{
-    AccessUnitInfo, CoreDecodeState, ParseError, decode_core_pcm_frame_with_state,
+    AccessUnitInfo, CoreDecodeState, ParseError, decode_core_pcm_frame_with_state_into,
     inspect_access_unit_with_metadata_state,
 };
 use crate::{
-    Decoder, PushResult, RENDER_714_CHANNEL_ORDER, Render714Error, Render714Frame, Renderer714,
+    CorePcmFrame, Decoder, PushResult, RENDER_714_CHANNEL_ORDER, Render714Error, Render714Frame,
+    Renderer714,
 };
 
 const STARMINE_AD_RENDER_714_CHANNELS: usize = 12;
@@ -277,6 +278,7 @@ static STATUS_SAMPLE_RATE_CHANGED: &[u8] = b"sample-rate-changed\0";
 pub struct StarmineAdRenderer714Handle {
     frames_seen: u64,
     core_state: CoreDecodeState,
+    core_pcm: CorePcmFrame,
     joc_state: JocObjectDecoderState,
     metadata_state: MetadataParseState,
     renderer: Renderer714,
@@ -292,6 +294,12 @@ impl Default for StarmineAdRenderer714Handle {
         Self {
             frames_seen: 0,
             core_state: CoreDecodeState::default(),
+            core_pcm: CorePcmFrame {
+                sample_rate: 0,
+                fullband_channel_order: Vec::new(),
+                fullband_channels: Vec::new(),
+                lfe_channel: None,
+            },
             joc_state: JocObjectDecoderState::default(),
             metadata_state: MetadataParseState::default(),
             renderer: Renderer714::default(),
@@ -340,10 +348,15 @@ impl StarmineAdRenderer714Handle {
         });
 
         if let Some(joc) = joc {
-            let core = decode_core_pcm_frame_with_state(access_unit, &info, &mut self.core_state)
-                .map_err(StarmineAdStatus::from_parse_error)?;
+            decode_core_pcm_frame_with_state_into(
+                access_unit,
+                &info,
+                &mut self.core_state,
+                &mut self.core_pcm,
+            )
+            .map_err(StarmineAdStatus::from_parse_error)?;
             self.joc_state
-                .decode_frame_into(&core, joc, &mut self.object_channels)
+                .decode_frame_into(&self.core_pcm, joc, &mut self.object_channels)
                 .map_err(StarmineAdStatus::from_parse_error)?;
             let oamd = info.payloads().find_map(|payload| match &payload.parsed {
                 ParsedEmdfPayloadData::Oamd(oamd) => Some(oamd),
@@ -356,7 +369,7 @@ impl StarmineAdRenderer714Handle {
 
             self.renderer
                 .render_into_channels(
-                    &core,
+                    &self.core_pcm,
                     &self.object_channels,
                     oamd,
                     oamd_sample_offset,
@@ -364,8 +377,8 @@ impl StarmineAdRenderer714Handle {
                 )
                 .map_err(StarmineAdStatus::from_render_error)?;
             self.last_rendered_has_frame = true;
-            self.last_rendered_sample_rate = core.sample_rate;
-            self.last_rendered_samples_per_channel = core.samples_per_channel();
+            self.last_rendered_sample_rate = self.core_pcm.sample_rate;
+            self.last_rendered_samples_per_channel = self.core_pcm.samples_per_channel();
         }
 
         self.frames_seen += 1;

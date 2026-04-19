@@ -173,6 +173,7 @@ pub(crate) struct AllocationState {
     bap: Vec<u8>,
     excite: Vec<i32>,
     mask: Vec<i32>,
+    grouped_scratch: Vec<i32>,
 }
 
 impl AllocationState {
@@ -184,6 +185,7 @@ impl AllocationState {
             bap: vec![0; MAX_ALLOCATION_SIZE],
             excite: vec![0; MASK_BANDS],
             mask: vec![0; MASK_BANDS],
+            grouped_scratch: Vec::new(),
         }
     }
 
@@ -199,12 +201,24 @@ impl AllocationState {
         end_mantissa: usize,
     ) -> Result<(), ParseError> {
         let absolute_exponent = reader.read_bits(4).ok_or(ParseError::ShortPacket)? as i32;
-        let mut grouped = Vec::with_capacity(groups);
+        self.grouped_scratch.clear();
+        self.grouped_scratch.reserve(groups);
         for _ in 0..groups {
-            grouped.push(reader.read_bits(7).ok_or(ParseError::ShortPacket)? as i32);
+            self.grouped_scratch
+                .push(reader.read_bits(7).ok_or(ParseError::ShortPacket)? as i32);
         }
         reader.skip_bits(2).ok_or(ParseError::ShortPacket)?;
-        self.decode_grouped_exponents(strategy, 0, 1, end_mantissa, absolute_exponent, &grouped)
+        let grouped = std::mem::take(&mut self.grouped_scratch);
+        let result = self.decode_grouped_exponents(
+            strategy,
+            0,
+            1,
+            end_mantissa,
+            absolute_exponent,
+            &grouped,
+        );
+        self.grouped_scratch = grouped;
+        result
     }
 
     pub(crate) fn read_lfe_exponents(
@@ -212,17 +226,23 @@ impl AllocationState {
         reader: &mut crate::bitstream::BitReader<'_>,
     ) -> Result<(), ParseError> {
         let absolute_exponent = reader.read_bits(4).ok_or(ParseError::ShortPacket)? as i32;
-        let mut grouped = Vec::with_capacity(2);
-        grouped.push(reader.read_bits(7).ok_or(ParseError::ShortPacket)? as i32);
-        grouped.push(reader.read_bits(7).ok_or(ParseError::ShortPacket)? as i32);
-        self.decode_grouped_exponents(
+        self.grouped_scratch.clear();
+        self.grouped_scratch.reserve(2);
+        self.grouped_scratch
+            .push(reader.read_bits(7).ok_or(ParseError::ShortPacket)? as i32);
+        self.grouped_scratch
+            .push(reader.read_bits(7).ok_or(ParseError::ShortPacket)? as i32);
+        let grouped = std::mem::take(&mut self.grouped_scratch);
+        let result = self.decode_grouped_exponents(
             ExpStrategy::D15,
             0,
             1,
             LFE_END_MANTISSA,
             absolute_exponent,
             &grouped,
-        )
+        );
+        self.grouped_scratch = grouped;
+        result
     }
 
     pub(crate) fn allocate(

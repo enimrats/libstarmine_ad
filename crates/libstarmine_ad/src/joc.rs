@@ -236,8 +236,9 @@ fn prepare_object_output_buffers(output: &mut Vec<Vec<f32>>, object_count: usize
         output.truncate(object_count);
     }
     for channel in output.iter_mut() {
-        channel.resize(samples, 0.0);
-        channel.fill(0.0);
+        if channel.len() != samples {
+            channel.resize(samples, 0.0);
+        }
     }
 }
 

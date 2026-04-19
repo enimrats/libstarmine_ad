@@ -1,7 +1,12 @@
 use crate::metadata::{
     BedChannel, OamdElementKind, OamdObjectBlock, OamdPayload, ObjectAnchor, Vec3,
 };
+
 use crate::pcm::{CorePcmFrame, ObjectPcmFrame};
+#[cfg(target_arch = "aarch64")]
+use std::arch::aarch64::{
+    vabsq_f32, vdupq_n_f32, vfmaq_f32, vld1q_f32, vmaxq_f32, vmaxvq_f32, vmulq_f32, vst1q_f32,
+};
 
 const RENDER_TIMESLOT_SAMPLES: usize = 64;
 const RENDER_714_CHANNELS: usize = 12;
@@ -1359,18 +1364,16 @@ fn apply_output_limiter(channels: &mut [Vec<f32>], last_gain: &mut f32, sample_r
         let block_end = (block_start + RENDER_TIMESLOT_SAMPLES).min(samples);
         let mut max = 0.0f32;
         for channel in channels.iter() {
-            for sample in channel[block_start..block_end].iter().copied() {
-                max = max.max(sample.abs());
-            }
+            max = max.max(max_abs_slice(&channel[block_start..block_end]));
         }
 
         if max * *last_gain > 1.0 {
             *last_gain = 0.9 / max;
         }
 
-        for channel in channels.iter_mut() {
-            for sample in &mut channel[block_start..block_end] {
-                *sample *= *last_gain;
+        if *last_gain != 1.0 {
+            for channel in channels.iter_mut() {
+                scale_slice_in_place(&mut channel[block_start..block_end], *last_gain);
             }
         }
 
@@ -1385,24 +1388,126 @@ fn mix_full_channel(input: &[f32], output: &mut [f32], gain: f32) {
     if gain == 0.0 {
         return;
     }
-    for (target, sample) in output.iter_mut().zip(input.iter().copied()) {
-        *target += sample * gain;
-    }
+    mix_add_scaled(input, output, gain);
 }
 
 fn limiter_disabled() -> bool {
-    std::env::var_os("STARMINE_AD_DISABLE_LIMITER").is_some()
+    #[cfg(debug_assertions)]
+    {
+        std::env::var_os("STARMINE_AD_DISABLE_LIMITER").is_some()
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        false
+    }
 }
 
 fn mix_segment(input: &[f32], output: &mut [f32], offset: usize, gain: f32) {
     if gain == 0.0 {
         return;
     }
-    for (target, sample) in output[offset..offset + input.len()]
-        .iter_mut()
-        .zip(input.iter().copied())
+    mix_add_scaled(input, &mut output[offset..offset + input.len()], gain);
+}
+
+fn mix_add_scaled(input: &[f32], output: &mut [f32], gain: f32) {
+    debug_assert_eq!(input.len(), output.len());
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        mix_add_scaled_neon(input.as_ptr(), output.as_mut_ptr(), input.len(), gain);
+        return;
+    }
+    #[cfg(not(target_arch = "aarch64"))]
     {
-        *target += sample * gain;
+        for (target, sample) in output.iter_mut().zip(input.iter().copied()) {
+            *target += sample * gain;
+        }
+    }
+}
+
+fn max_abs_slice(samples: &[f32]) -> f32 {
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        return max_abs_slice_neon(samples.as_ptr(), samples.len());
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let mut max = 0.0f32;
+        for sample in samples.iter().copied() {
+            max = max.max(sample.abs());
+        }
+        max
+    }
+}
+
+fn scale_slice_in_place(samples: &mut [f32], gain: f32) {
+    if gain == 1.0 {
+        return;
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        scale_slice_in_place_neon(samples.as_mut_ptr(), samples.len(), gain);
+        return;
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        for sample in samples {
+            *sample *= gain;
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn mix_add_scaled_neon(input: *const f32, output: *mut f32, len: usize, gain: f32) {
+    let gainv = vdupq_n_f32(gain);
+    let mut index = 0usize;
+    while index + 4 <= len {
+        let mixed = vfmaq_f32(
+            vld1q_f32(output.add(index)),
+            vld1q_f32(input.add(index)),
+            gainv,
+        );
+        vst1q_f32(output.add(index), mixed);
+        index += 4;
+    }
+    while index < len {
+        *output.add(index) += *input.add(index) * gain;
+        index += 1;
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn max_abs_slice_neon(input: *const f32, len: usize) -> f32 {
+    let mut acc = vdupq_n_f32(0.0);
+    let mut index = 0usize;
+    while index + 4 <= len {
+        acc = vmaxq_f32(acc, vabsq_f32(vld1q_f32(input.add(index))));
+        index += 4;
+    }
+    let mut max = vmaxvq_f32(acc);
+    while index < len {
+        max = max.max((*input.add(index)).abs());
+        index += 1;
+    }
+    max
+}
+
+#[cfg(target_arch = "aarch64")]
+#[allow(unsafe_op_in_unsafe_fn)]
+unsafe fn scale_slice_in_place_neon(output: *mut f32, len: usize, gain: f32) {
+    let gainv = vdupq_n_f32(gain);
+    let mut index = 0usize;
+    while index + 4 <= len {
+        vst1q_f32(
+            output.add(index),
+            vmulq_f32(vld1q_f32(output.add(index)), gainv),
+        );
+        index += 4;
+    }
+    while index < len {
+        *output.add(index) *= gain;
+        index += 1;
     }
 }
 

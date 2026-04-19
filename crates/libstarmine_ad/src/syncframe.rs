@@ -789,7 +789,7 @@ pub(crate) fn inspect_access_unit_with_metadata_state(
                     aux_parse_status = AuxParseStatus::Extracted;
                 }
                 Err(err @ ParseError::UnsupportedFeature(_)) => {
-                    if std::env::var_os("STARMINE_AD_DEBUG_AUX").is_some() {
+                    if debug_aux_enabled() {
                         eprintln!("no-blkstart frame sequential parse error: {err}");
                     }
                     // TODO: Delete this EMDF-anchored fallback once no-blkstrtinfo walking
@@ -806,7 +806,7 @@ pub(crate) fn inspect_access_unit_with_metadata_state(
                     | ParseError::InvalidHeader("block-end")
                     | ParseError::InvalidHeader("mantissa-range")),
                 ) => {
-                    if std::env::var_os("STARMINE_AD_DEBUG_AUX").is_some() {
+                    if debug_aux_enabled() {
                         eprintln!("no-blkstart frame sequential parse error: {err}");
                     }
                     if let Some(recovered_fields) = recover_skip_fields_from_emdf_markers(frame) {
@@ -1328,7 +1328,7 @@ fn collect_skip_fields_without_block_start(
         )? {
             skip_fields.push(skip_field);
         }
-        if std::env::var_os("STARMINE_AD_DEBUG_AUX").is_some() {
+        if debug_aux_enabled() {
             let skip_len = skip_fields
                 .last()
                 .filter(|field| field.block_index == Some(block))
@@ -2106,6 +2106,22 @@ pub(crate) fn decode_core_pcm_frame_with_state(
     info: &AccessUnitInfo,
     state: &mut CoreDecodeState,
 ) -> Result<CorePcmFrame, ParseError> {
+    let mut pcm = CorePcmFrame {
+        sample_rate: 0,
+        fullband_channel_order: Vec::new(),
+        fullband_channels: Vec::new(),
+        lfe_channel: None,
+    };
+    decode_core_pcm_frame_with_state_into(frame, info, state, &mut pcm)?;
+    Ok(pcm)
+}
+
+pub(crate) fn decode_core_pcm_frame_with_state_into(
+    frame: &[u8],
+    info: &AccessUnitInfo,
+    state: &mut CoreDecodeState,
+    pcm: &mut CorePcmFrame,
+) -> Result<(), ParseError> {
     if info.frame_type != FrameType::Independent {
         // TODO: Merge dependent / converted substreams before exposing a general PCM path.
         return Err(ParseError::UnsupportedFeature("non-independent-core-pcm"));
@@ -2123,8 +2139,15 @@ pub(crate) fn decode_core_pcm_frame_with_state(
     }
 
     let frame_samples = info.num_blocks as usize * 256;
-    let mut fullband_channels = vec![vec![0.0f32; frame_samples]; info.fullband_channels as usize];
-    let mut lfe_channel = info.lfe_on.then(|| vec![0.0f32; frame_samples]);
+    pcm.sample_rate = info.sample_rate;
+    pcm.fullband_channel_order.clear();
+    pcm.fullband_channel_order.extend_from_slice(fullband_order);
+    prepare_core_channel_storage(
+        &mut pcm.fullband_channels,
+        info.fullband_channels as usize,
+        frame_samples,
+    );
+    prepare_lfe_channel_storage(&mut pcm.lfe_channel, info.lfe_on, frame_samples);
     state.reconfigure(
         info.fullband_channels as usize,
         info.lfe_on,
@@ -2148,17 +2171,35 @@ pub(crate) fn decode_core_pcm_frame_with_state(
             block_syntax,
             imdct,
             lfe_imdct.as_mut(),
-            &mut fullband_channels,
-            lfe_channel.as_mut(),
+            &mut pcm.fullband_channels,
+            pcm.lfe_channel.as_mut(),
         )?;
     }
 
-    Ok(CorePcmFrame {
-        sample_rate: info.sample_rate,
-        fullband_channel_order: fullband_order.to_vec(),
-        fullband_channels,
-        lfe_channel,
-    })
+    Ok(())
+}
+
+fn prepare_core_channel_storage(channels: &mut Vec<Vec<f32>>, count: usize, samples: usize) {
+    channels.resize_with(count, Vec::new);
+    if channels.len() > count {
+        channels.truncate(count);
+    }
+    for channel in channels.iter_mut() {
+        if channel.len() != samples {
+            channel.resize(samples, 0.0);
+        }
+    }
+}
+
+fn prepare_lfe_channel_storage(channel: &mut Option<Vec<f32>>, enabled: bool, samples: usize) {
+    if enabled {
+        let storage = channel.get_or_insert_with(Vec::new);
+        if storage.len() != samples {
+            storage.resize(samples, 0.0);
+        }
+    } else {
+        *channel = None;
+    }
 }
 
 fn fullband_channel_order(channel_mode: u8) -> Result<&'static [BedChannel], ParseError> {
@@ -2582,7 +2623,14 @@ fn log2_ceil(value: usize) -> usize {
 }
 
 fn debug_aux_enabled() -> bool {
-    std::env::var_os("STARMINE_AD_DEBUG_AUX").is_some()
+    #[cfg(debug_assertions)]
+    {
+        std::env::var_os("STARMINE_AD_DEBUG_AUX").is_some()
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        false
+    }
 }
 
 #[cfg(test)]

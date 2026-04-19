@@ -437,7 +437,14 @@ impl OamdObjectBlockParseState {
 }
 
 fn debug_metadata_enabled() -> bool {
-    std::env::var_os("STARMINE_AD_DEBUG_METADATA").is_some()
+    #[cfg(debug_assertions)]
+    {
+        std::env::var_os("STARMINE_AD_DEBUG_METADATA").is_some()
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        false
+    }
 }
 
 fn parse_oamd_payload(reader: &mut BitReader<'_>) -> Result<OamdPayload, ParseError> {

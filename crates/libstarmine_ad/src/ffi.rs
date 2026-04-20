@@ -9,8 +9,8 @@ use crate::syncframe::{
     inspect_access_unit_with_metadata_state,
 };
 use crate::{
-    CorePcmFrame, Decoder, PushResult, RENDER_714_CHANNEL_ORDER, Render714Error, Render714Frame,
-    Renderer714,
+    CorePcmFrame, Decoder, PushResult, Render714Error, Render714Frame, RenderInputChannel,
+    RenderInputFrame, Renderer714,
 };
 
 const STARMINE_AD_RENDER_714_CHANNELS: usize = 12;
@@ -132,28 +132,6 @@ impl From<&Render714Frame> for StarmineAdRender714Frame {
     }
 }
 
-impl StarmineAdRender714Frame {
-    fn from_channel_storage(
-        sample_rate: u32,
-        samples_per_channel: usize,
-        channels: &[Vec<f32>; STARMINE_AD_RENDER_714_CHANNELS],
-    ) -> Self {
-        let mut result = Self::empty();
-
-        result.has_frame = 1;
-        result.sample_rate = sample_rate;
-        result.samples_per_channel = samples_per_channel;
-        result.channel_count = STARMINE_AD_RENDER_714_CHANNELS;
-
-        for (index, channel) in channels.iter().enumerate() {
-            result.channels[index] = channel.as_ptr();
-            result.channel_order[index] = RENDER_714_CHANNEL_ORDER[index].into();
-        }
-
-        result
-    }
-}
-
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// C ABI status code returned by every exported function.
@@ -173,6 +151,7 @@ pub enum StarmineAdStatus {
     UnsupportedSampleCount = -12,
     UnsupportedBedChannel = -13,
     SampleRateChanged = -14,
+    BedChannelCountMismatch = -15,
 }
 
 impl StarmineAdStatus {
@@ -193,10 +172,36 @@ impl StarmineAdStatus {
             Render714Error::MissingOamd => Self::MissingOamd,
             Render714Error::OamdStateUninitialized => Self::OamdStateUninitialized,
             Render714Error::ObjectCountMismatch { .. } => Self::ObjectCountMismatch,
+            Render714Error::BedChannelCountMismatch { .. } => Self::BedChannelCountMismatch,
             Render714Error::UnsupportedSampleCount(_) => Self::UnsupportedSampleCount,
             Render714Error::UnsupportedBedChannel(_) => Self::UnsupportedBedChannel,
             Render714Error::SampleRateChanged { .. } => Self::SampleRateChanged,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{StarmineAdStatus, starmine_ad_status_string};
+    use crate::Render714Error;
+    use std::ffi::CStr;
+
+    #[test]
+    fn bed_channel_count_mismatch_uses_bed_status() {
+        let status = StarmineAdStatus::from_render_error(Render714Error::BedChannelCountMismatch {
+            expected: 2,
+            provided: 1,
+        });
+        assert_eq!(status, StarmineAdStatus::BedChannelCountMismatch);
+    }
+
+    #[test]
+    fn bed_channel_count_mismatch_status_string_is_stable() {
+        let ptr = starmine_ad_status_string(StarmineAdStatus::BedChannelCountMismatch);
+        let value = unsafe { CStr::from_ptr(ptr) }
+            .to_str()
+            .expect("valid utf-8");
+        assert_eq!(value, "bed-channel-count-mismatch");
     }
 }
 
@@ -273,6 +278,7 @@ static STATUS_OBJECT_COUNT_MISMATCH: &[u8] = b"object-count-mismatch\0";
 static STATUS_UNSUPPORTED_SAMPLE_COUNT: &[u8] = b"unsupported-sample-count\0";
 static STATUS_UNSUPPORTED_BED_CHANNEL: &[u8] = b"unsupported-bed-channel\0";
 static STATUS_SAMPLE_RATE_CHANGED: &[u8] = b"sample-rate-changed\0";
+static STATUS_BED_CHANNEL_COUNT_MISMATCH: &[u8] = b"bed-channel-count-mismatch\0";
 
 #[derive(Debug)]
 pub struct StarmineAdRenderer714Handle {
@@ -283,10 +289,7 @@ pub struct StarmineAdRenderer714Handle {
     metadata_state: MetadataParseState,
     renderer: Renderer714,
     object_channels: Vec<Vec<f32>>,
-    last_rendered_has_frame: bool,
-    last_rendered_sample_rate: u32,
-    last_rendered_samples_per_channel: usize,
-    last_rendered_channels: [Vec<f32>; STARMINE_AD_RENDER_714_CHANNELS],
+    last_rendered: Option<Render714Frame>,
 }
 
 impl Default for StarmineAdRenderer714Handle {
@@ -304,10 +307,7 @@ impl Default for StarmineAdRenderer714Handle {
             metadata_state: MetadataParseState::default(),
             renderer: Renderer714::default(),
             object_channels: Vec::new(),
-            last_rendered_has_frame: false,
-            last_rendered_sample_rate: 0,
-            last_rendered_samples_per_channel: 0,
-            last_rendered_channels: std::array::from_fn(|_| Vec::new()),
+            last_rendered: None,
         }
     }
 }
@@ -324,9 +324,7 @@ impl StarmineAdRenderer714Handle {
     }
 
     fn clear_last_rendered(&mut self) {
-        self.last_rendered_has_frame = false;
-        self.last_rendered_sample_rate = 0;
-        self.last_rendered_samples_per_channel = 0;
+        self.last_rendered = None;
     }
 
     fn push_access_unit(&mut self, access_unit: &[u8]) -> Result<AccessUnitInfo, StarmineAdStatus> {
@@ -367,18 +365,17 @@ impl StarmineAdRenderer714Handle {
                 _ => None,
             });
 
-            self.renderer
-                .render_into_channels(
-                    &self.core_pcm,
-                    &self.object_channels,
-                    oamd,
-                    oamd_sample_offset,
-                    &mut self.last_rendered_channels,
-                )
-                .map_err(StarmineAdStatus::from_render_error)?;
-            self.last_rendered_has_frame = true;
-            self.last_rendered_sample_rate = self.core_pcm.sample_rate;
-            self.last_rendered_samples_per_channel = self.core_pcm.samples_per_channel();
+            let input = render_input_frame_from_parts(
+                &self.core_pcm,
+                &self.object_channels,
+                oamd,
+                oamd_sample_offset,
+            );
+            self.last_rendered = Some(
+                self.renderer
+                    .push_frame(&input)
+                    .map_err(StarmineAdStatus::from_render_error)?,
+            );
         }
 
         self.frames_seen += 1;
@@ -494,12 +491,8 @@ pub unsafe extern "C" fn starmine_ad_renderer_714_push_access_unit(
                 *out_info = StarmineAdAccessUnitInfo::from_parts(&info, renderer.frames_seen);
             }
             if let Some(out_frame) = unsafe { out_frame.as_mut() } {
-                if renderer.last_rendered_has_frame {
-                    *out_frame = StarmineAdRender714Frame::from_channel_storage(
-                        renderer.last_rendered_sample_rate,
-                        renderer.last_rendered_samples_per_channel,
-                        &renderer.last_rendered_channels,
-                    );
+                if let Some(frame) = renderer.last_rendered.as_ref() {
+                    *out_frame = StarmineAdRender714Frame::from(frame);
                 }
             }
             StarmineAdStatus::Ok
@@ -527,8 +520,44 @@ pub extern "C" fn starmine_ad_status_string(status: StarmineAdStatus) -> *const 
         StarmineAdStatus::UnsupportedSampleCount => STATUS_UNSUPPORTED_SAMPLE_COUNT.as_ptr(),
         StarmineAdStatus::UnsupportedBedChannel => STATUS_UNSUPPORTED_BED_CHANNEL.as_ptr(),
         StarmineAdStatus::SampleRateChanged => STATUS_SAMPLE_RATE_CHANGED.as_ptr(),
+        StarmineAdStatus::BedChannelCountMismatch => STATUS_BED_CHANNEL_COUNT_MISMATCH.as_ptr(),
     }
     .cast::<c_char>()
+}
+
+fn render_input_frame_from_parts(
+    core: &CorePcmFrame,
+    object_channels: &[Vec<f32>],
+    oamd: Option<&crate::OamdPayload>,
+    oamd_sample_offset: Option<u16>,
+) -> RenderInputFrame {
+    let mut bed_channels =
+        Vec::with_capacity(core.fullband_channels.len() + usize::from(core.lfe_channel.is_some()));
+    for (channel, samples) in core
+        .fullband_channel_order
+        .iter()
+        .copied()
+        .zip(core.fullband_channels.iter())
+    {
+        bed_channels.push(RenderInputChannel {
+            channel,
+            samples: samples.clone(),
+        });
+    }
+    if let Some(samples) = core.lfe_channel.as_ref() {
+        bed_channels.push(RenderInputChannel {
+            channel: BedChannel::LowFrequencyEffects,
+            samples: samples.clone(),
+        });
+    }
+
+    RenderInputFrame {
+        sample_rate: core.sample_rate,
+        bed_channels,
+        object_channels: object_channels.to_vec(),
+        oamd: oamd.cloned(),
+        oamd_sample_offset,
+    }
 }
 
 #[unsafe(no_mangle)]

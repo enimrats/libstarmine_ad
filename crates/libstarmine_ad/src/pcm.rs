@@ -2,6 +2,7 @@ use crate::joc::{JocObjectDecoderState, JocObjectMatrices};
 use crate::metadata::{
     BedChannel, JocPayload, MetadataParseState, OamdPayload, ParsedEmdfPayloadData,
 };
+use crate::render::{RenderInputChannel, RenderInputFrame};
 use crate::syncframe::{
     AccessUnitInfo, CoreDecodeState, ParseError, decode_core_pcm_frame_with_state,
     inspect_access_unit_with_metadata_state,
@@ -54,6 +55,78 @@ impl ObjectPcmFrame {
     /// Number of dynamic object channels decoded for this frame.
     pub fn object_count(&self) -> usize {
         self.object_channels.len()
+    }
+}
+
+impl From<&ObjectPcmFrame> for RenderInputFrame {
+    fn from(frame: &ObjectPcmFrame) -> Self {
+        let mut bed_channels = Vec::with_capacity(
+            frame.core.fullband_channels.len() + usize::from(frame.core.lfe_channel.is_some()),
+        );
+        for (channel, samples) in frame
+            .core
+            .fullband_channel_order
+            .iter()
+            .copied()
+            .zip(frame.core.fullband_channels.iter())
+        {
+            bed_channels.push(RenderInputChannel {
+                channel,
+                samples: samples.clone(),
+            });
+        }
+        if let Some(lfe) = frame.core.lfe_channel.as_ref() {
+            bed_channels.push(RenderInputChannel {
+                channel: BedChannel::LowFrequencyEffects,
+                samples: lfe.clone(),
+            });
+        }
+
+        Self {
+            sample_rate: frame.core.sample_rate,
+            bed_channels,
+            object_channels: frame.object_channels.clone(),
+            oamd: frame.oamd.clone(),
+            oamd_sample_offset: frame.oamd_sample_offset,
+        }
+    }
+}
+
+impl From<ObjectPcmFrame> for RenderInputFrame {
+    fn from(frame: ObjectPcmFrame) -> Self {
+        let ObjectPcmFrame {
+            core,
+            object_channels,
+            oamd,
+            oamd_sample_offset,
+            ..
+        } = frame;
+        let CorePcmFrame {
+            sample_rate,
+            fullband_channel_order,
+            fullband_channels,
+            lfe_channel,
+        } = core;
+
+        let mut bed_channels =
+            Vec::with_capacity(fullband_channels.len() + usize::from(lfe_channel.is_some()));
+        for (channel, samples) in fullband_channel_order.into_iter().zip(fullband_channels) {
+            bed_channels.push(RenderInputChannel { channel, samples });
+        }
+        if let Some(samples) = lfe_channel {
+            bed_channels.push(RenderInputChannel {
+                channel: BedChannel::LowFrequencyEffects,
+                samples,
+            });
+        }
+
+        Self {
+            sample_rate,
+            bed_channels,
+            object_channels,
+            oamd,
+            oamd_sample_offset,
+        }
     }
 }
 

@@ -10,7 +10,8 @@ use std::time::Instant;
 use raw_eac3::RawEac3FrameIter;
 use starmine_ad::{
     BedChannel, CorePcmFrame, Decoder, JocObjectMatrices, ObjectPcmDecoder, ObjectPcmFrame,
-    PcmDecoder, RENDER_714_CHANNEL_ORDER, Render714Frame, Render714TimeslotDebug, Renderer714,
+    PcmDecoder, RENDER_714_CHANNEL_ORDER, Render714Frame, Render714TimeslotDebug, RenderInputFrame,
+    Renderer714,
 };
 
 #[derive(Debug, Clone)]
@@ -906,8 +907,9 @@ fn process_raw_eac3(input: &Path, bytes: &[u8], options: &RunOptions) -> ExitCod
             };
 
             let (render_714, render_debug) = if use_render_714 {
+                let render_input = RenderInputFrame::from(&result.pcm);
                 if render_positions_writer.is_some() {
-                    match renderer_714.push_frame_with_debug(&result.pcm) {
+                    match renderer_714.push_frame_with_debug(&render_input) {
                         Ok((rendered, debug)) => (Some(rendered), Some(debug)),
                         Err(err) => {
                             eprintln!("render 7.1.4 error on frame {}: {err}", frames);
@@ -915,7 +917,7 @@ fn process_raw_eac3(input: &Path, bytes: &[u8], options: &RunOptions) -> ExitCod
                         }
                     }
                 } else {
-                    match renderer_714.push_frame(&result.pcm) {
+                    match renderer_714.push_frame(&render_input) {
                         Ok(rendered) => (Some(rendered), None),
                         Err(err) => {
                             eprintln!("render 7.1.4 error on frame {}: {err}", frames);
@@ -1284,7 +1286,8 @@ fn process_frame_dir(input_dir: &Path, options: &RunOptions) -> ExitCode {
             };
 
             let render_714 = if use_render_714 {
-                match renderer_714.push_frame(&result.pcm) {
+                let render_input = RenderInputFrame::from(&result.pcm);
+                match renderer_714.push_frame(&render_input) {
                     Ok(rendered) => Some(rendered),
                     Err(err) => {
                         eprintln!("render 7.1.4 error on {}: {err}", path.display());

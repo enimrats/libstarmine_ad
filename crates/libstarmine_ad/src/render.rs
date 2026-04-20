@@ -1,8 +1,6 @@
 use crate::metadata::{
     BedChannel, OamdElementKind, OamdObjectBlock, OamdPayload, ObjectAnchor, Vec3,
 };
-
-use crate::pcm::{CorePcmFrame, ObjectPcmFrame};
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::{
     vabsq_f32, vdupq_n_f32, vfmaq_f32, vld1q_f32, vmaxq_f32, vmaxvq_f32, vmulq_f32, vst1q_f32,
@@ -113,6 +111,26 @@ const RENDER_714_CHANNEL_POSITIONS: [Vec3; RENDER_714_CHANNELS] = [
 ];
 
 #[derive(Debug, Clone, PartialEq)]
+/// One labeled bed channel carried by a [`RenderInputFrame`].
+pub struct RenderInputChannel {
+    pub channel: BedChannel,
+    pub samples: Vec<f32>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+/// Codec-agnostic input frame for [`Renderer714`].
+///
+/// Bed signals are passed as explicitly labeled channels, while `object_channels` only contains
+/// dynamic objects whose positions are described by `oamd`.
+pub struct RenderInputFrame {
+    pub sample_rate: u32,
+    pub bed_channels: Vec<RenderInputChannel>,
+    pub object_channels: Vec<Vec<f32>>,
+    pub oamd: Option<OamdPayload>,
+    pub oamd_sample_offset: Option<u16>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 /// One rendered 7.1.4 frame.
 pub struct Render714Frame {
     pub sample_rate: u32,
@@ -139,6 +157,27 @@ pub struct Render714TimeslotDebug {
     pub sources: Vec<Render714SourceDebug>,
 }
 
+impl RenderInputFrame {
+    /// Number of samples carried by each input channel.
+    pub fn samples_per_channel(&self) -> usize {
+        self.bed_channels
+            .first()
+            .map(|channel| channel.samples.len())
+            .or_else(|| self.object_channels.first().map(Vec::len))
+            .unwrap_or(0)
+    }
+
+    /// Number of bed channels in this frame.
+    pub fn bed_channel_count(&self) -> usize {
+        self.bed_channels.len()
+    }
+
+    /// Number of dynamic object channels in this frame.
+    pub fn object_count(&self) -> usize {
+        self.object_channels.len()
+    }
+}
+
 impl Render714Frame {
     /// Number of samples carried by each output channel.
     pub fn samples_per_channel(&self) -> usize {
@@ -157,6 +196,7 @@ pub enum Render714Error {
     MissingOamd,
     OamdStateUninitialized,
     ObjectCountMismatch { expected: usize, provided: usize },
+    BedChannelCountMismatch { expected: usize, provided: usize },
     UnsupportedSampleCount(usize),
     UnsupportedBedChannel(BedChannel),
     SampleRateChanged { expected: u32, provided: u32 },
@@ -171,6 +211,12 @@ impl std::fmt::Display for Render714Error {
                 write!(
                     f,
                     "object-count-mismatch expected={expected} provided={provided}"
+                )
+            }
+            Self::BedChannelCountMismatch { expected, provided } => {
+                write!(
+                    f,
+                    "bed-channel-count-mismatch expected={expected} provided={provided}"
                 )
             }
             Self::UnsupportedSampleCount(samples) => {
@@ -191,17 +237,46 @@ impl std::fmt::Display for Render714Error {
 
 impl std::error::Error for Render714Error {}
 
+#[derive(Debug, Clone, Copy)]
+struct RenderInputChannelRef<'a> {
+    channel: BedChannel,
+    samples: &'a [f32],
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RenderInputFrameRef<'a> {
+    sample_rate: u32,
+    bed_channels: &'a [RenderInputChannelRef<'a>],
+    object_channels: &'a [&'a [f32]],
+    oamd: Option<&'a OamdPayload>,
+    oamd_sample_offset: Option<u16>,
+}
+
+impl RenderInputFrameRef<'_> {
+    fn samples_per_channel(&self) -> usize {
+        self.bed_channels
+            .first()
+            .map(|channel| channel.samples.len())
+            .or_else(|| self.object_channels.first().map(|channel| channel.len()))
+            .unwrap_or(0)
+    }
+}
+
 #[derive(Debug)]
 /// Stateful 7.1.4 renderer.
 ///
-/// Feed frames from [`ObjectPcmDecoder`] in stream order. The renderer keeps object metadata,
-/// limiter state, and LFE low-pass history across frames, so it must be reset after seeks or any
-/// other discontinuity.
+/// Feed [`RenderInputFrame`] values in stream order. The renderer keeps object metadata, limiter
+/// state, and LFE low-pass history across frames, so it must be reset after seeks or any other
+/// discontinuity.
 pub struct Renderer714 {
     sample_rate: Option<u32>,
     limiter_gain: f32,
+    metadata_timeslot_phase: usize,
+    metadata_timeslot_timecode: i32,
     lfe_lowpass: Option<BiquadLowpassState>,
     metadata: OamdRendererState,
+    limiter_pending: Vec<Vec<f32>>,
+    pending_timeslot_debug: Vec<Render714TimeslotDebug>,
 }
 
 impl Default for Renderer714 {
@@ -209,8 +284,12 @@ impl Default for Renderer714 {
         Self {
             sample_rate: None,
             limiter_gain: 1.0,
+            metadata_timeslot_phase: 0,
+            metadata_timeslot_timecode: 0,
             lfe_lowpass: None,
             metadata: OamdRendererState::default(),
+            limiter_pending: vec![Vec::new(); RENDER_714_CHANNELS],
+            pending_timeslot_debug: Vec::new(),
         }
     }
 }
@@ -225,48 +304,86 @@ impl Renderer714 {
     pub fn reset(&mut self) {
         self.sample_rate = None;
         self.limiter_gain = 1.0;
+        self.metadata_timeslot_phase = 0;
+        self.metadata_timeslot_timecode = 0;
         self.lfe_lowpass = None;
         self.metadata.reset();
+        for channel in &mut self.limiter_pending {
+            channel.clear();
+        }
+        self.pending_timeslot_debug.clear();
     }
 
-    /// Render one [`ObjectPcmFrame`] to 7.1.4 float PCM.
-    pub fn push_frame(&mut self, frame: &ObjectPcmFrame) -> Result<Render714Frame, Render714Error> {
-        let samples = frame.samples_per_channel();
-        let mut channels = vec![vec![0.0f32; samples]; RENDER_714_CHANNELS];
-        self.push_frame_parts_impl(
-            &frame.core,
-            &frame.object_channels,
-            frame.oamd.as_ref(),
-            frame.oamd_sample_offset,
-            &mut channels,
-            None,
-        )?;
-        Ok(Render714Frame {
-            sample_rate: frame.core.sample_rate,
-            channel_order: RENDER_714_CHANNEL_ORDER.to_vec(),
-            channels,
-        })
+    /// Render one input frame to 7.1.4 float PCM.
+    ///
+    /// The output limiter finalizes audio in 64-sample blocks. Calls that end mid-block may
+    /// return fewer samples than they consumed; call [`Self::flush`] after the final input to
+    /// retrieve any trailing partial block.
+    pub fn push_frame(
+        &mut self,
+        frame: &RenderInputFrame,
+    ) -> Result<Render714Frame, Render714Error> {
+        let mut bed_channels = Vec::new();
+        let mut object_channels = Vec::new();
+        let input = render_input_from_frame(frame, &mut bed_channels, &mut object_channels);
+        self.push_frame_impl(&input)
     }
 
-    /// Render one frame and also capture the effective source state for every 64-sample timeslot.
+    /// Render one input frame and also capture the effective source state for every render
+    /// timeslot.
+    ///
+    /// Debug rows follow the samples returned by this call. If the limiter buffers a partial
+    /// block, its debug row is deferred until the corresponding audio is emitted.
     pub fn push_frame_with_debug(
         &mut self,
-        frame: &ObjectPcmFrame,
+        frame: &RenderInputFrame,
+    ) -> Result<(Render714Frame, Vec<Render714TimeslotDebug>), Render714Error> {
+        let mut bed_channels = Vec::new();
+        let mut object_channels = Vec::new();
+        let input = render_input_from_frame(frame, &mut bed_channels, &mut object_channels);
+        self.push_frame_with_debug_impl(&input)
+    }
+
+    /// Emit the final short limiter block after the last input frame in a stream.
+    ///
+    /// This should only be used at end of stream. If more input follows, call [`Self::reset`]
+    /// first to avoid mixing two independent limiter blocks together.
+    pub fn flush(&mut self) -> Option<Render714Frame> {
+        self.flush_impl().map(|(frame, _)| frame)
+    }
+
+    /// Like [`Self::flush`], but also returns deferred timeslot debug rows.
+    pub fn flush_with_debug(&mut self) -> Option<(Render714Frame, Vec<Render714TimeslotDebug>)> {
+        self.flush_impl()
+    }
+
+    fn push_frame_impl(
+        &mut self,
+        frame: &RenderInputFrameRef<'_>,
+    ) -> Result<Render714Frame, Render714Error> {
+        let (rendered, _) = self.push_frame_common_impl(frame)?;
+        Ok(rendered)
+    }
+
+    fn push_frame_with_debug_impl(
+        &mut self,
+        frame: &RenderInputFrameRef<'_>,
+    ) -> Result<(Render714Frame, Vec<Render714TimeslotDebug>), Render714Error> {
+        self.push_frame_common_impl(frame)
+    }
+
+    fn push_frame_common_impl(
+        &mut self,
+        frame: &RenderInputFrameRef<'_>,
     ) -> Result<(Render714Frame, Vec<Render714TimeslotDebug>), Render714Error> {
         let samples = frame.samples_per_channel();
         let mut channels = vec![vec![0.0f32; samples]; RENDER_714_CHANNELS];
         let mut debug = Vec::new();
-        self.push_frame_parts_impl(
-            &frame.core,
-            &frame.object_channels,
-            frame.oamd.as_ref(),
-            frame.oamd_sample_offset,
-            &mut channels,
-            Some(&mut debug),
-        )?;
+        self.push_frame_parts_impl(frame, &mut channels, &mut debug)?;
+        let (channels, debug) = self.finalize_output(channels, debug, frame.sample_rate);
         Ok((
             Render714Frame {
-                sample_rate: frame.core.sample_rate,
+                sample_rate: frame.sample_rate,
                 channel_order: RENDER_714_CHANNEL_ORDER.to_vec(),
                 channels,
             },
@@ -274,49 +391,30 @@ impl Renderer714 {
         ))
     }
 
-    pub(crate) fn render_into_channels(
-        &mut self,
-        core: &CorePcmFrame,
-        object_channels: &[Vec<f32>],
-        oamd: Option<&OamdPayload>,
-        oamd_sample_offset: Option<u16>,
-        channels: &mut [Vec<f32>],
-    ) -> Result<(), Render714Error> {
-        self.push_frame_parts_impl(
-            core,
-            object_channels,
-            oamd,
-            oamd_sample_offset,
-            channels,
-            None,
-        )
-    }
-
     fn push_frame_parts_impl(
         &mut self,
-        core: &CorePcmFrame,
-        object_channels: &[Vec<f32>],
-        oamd: Option<&OamdPayload>,
-        oamd_sample_offset: Option<u16>,
+        frame: &RenderInputFrameRef<'_>,
         channels: &mut [Vec<f32>],
-        mut debug: Option<&mut Vec<Render714TimeslotDebug>>,
+        debug: &mut Vec<Render714TimeslotDebug>,
     ) -> Result<(), Render714Error> {
         match self.sample_rate {
-            Some(sample_rate) if sample_rate != core.sample_rate => {
+            Some(sample_rate) if sample_rate != frame.sample_rate => {
                 return Err(Render714Error::SampleRateChanged {
                     expected: sample_rate,
-                    provided: core.sample_rate,
+                    provided: frame.sample_rate,
                 });
             }
             None => {
-                self.sample_rate = Some(core.sample_rate);
-                self.lfe_lowpass = Some(BiquadLowpassState::new(core.sample_rate));
+                self.sample_rate = Some(frame.sample_rate);
+                self.lfe_lowpass = Some(BiquadLowpassState::new(frame.sample_rate));
             }
             Some(_) => {}
         }
 
-        if let Some(oamd) = oamd {
-            self.metadata.apply_payload(oamd, oamd_sample_offset);
+        if let Some(oamd) = frame.oamd {
+            self.metadata.apply_payload(oamd, frame.oamd_sample_offset);
+            self.metadata_timeslot_phase = 0;
+            self.metadata_timeslot_timecode = 0;
         } else if !self.metadata.initialized {
             return Err(Render714Error::MissingOamd);
         }
@@ -325,39 +423,43 @@ impl Renderer714 {
             return Err(Render714Error::OamdStateUninitialized);
         }
 
+        // OAMD bed object cardinality does not necessarily match the decoded PCM bed-channel
+        // count, so we only validate the dynamic object side here.
         let dynamic_object_count = self.metadata.dynamic_object_count();
-        if dynamic_object_count != object_channels.len() {
+        if dynamic_object_count != frame.object_channels.len() {
             return Err(Render714Error::ObjectCountMismatch {
                 expected: dynamic_object_count,
-                provided: object_channels.len(),
+                provided: frame.object_channels.len(),
             });
         }
 
-        let samples = core.samples_per_channel();
-        if samples == 0 || samples % RENDER_TIMESLOT_SAMPLES != 0 {
+        let samples = validate_render_input_sample_counts(frame)?;
+        if samples == 0 {
             return Err(Render714Error::UnsupportedSampleCount(samples));
         }
-        if let Some(debug_rows) = debug.as_deref_mut() {
-            debug_rows.reserve(samples / RENDER_TIMESLOT_SAMPLES);
-        }
+        debug.reserve(samples.div_ceil(RENDER_TIMESLOT_SAMPLES) + 1);
 
         prepare_render_channels(channels, samples);
         mix_bed_objects_to_714(
-            core,
-            self.metadata.bed_channels(),
+            frame.bed_channels,
+            &self.metadata.bed_channels,
             self.metadata.bed_sources(),
             channels,
         )?;
 
-        for timeslot in 0..(samples / RENDER_TIMESLOT_SAMPLES) {
-            let sample_offset = timeslot * RENDER_TIMESLOT_SAMPLES;
-            self.metadata.update_timeslot(sample_offset as i32);
-            if let Some(debug_rows) = debug.as_deref_mut() {
-                debug_rows.push(self.capture_timeslot_debug(sample_offset));
+        let mut sample_offset = 0usize;
+        while sample_offset < samples {
+            if self.metadata_timeslot_phase == 0 {
+                self.metadata
+                    .update_timeslot(self.metadata_timeslot_timecode, RENDER_TIMESLOT_SAMPLES);
+                debug.push(self.capture_timeslot_debug(sample_offset));
             }
-            let sample_end = sample_offset + RENDER_TIMESLOT_SAMPLES;
+            let sample_end = sample_offset
+                + (RENDER_TIMESLOT_SAMPLES - self.metadata_timeslot_phase)
+                    .min(samples - sample_offset);
+            let timeslot_samples = sample_end - sample_offset;
 
-            for (object_index, object_samples) in object_channels.iter().enumerate() {
+            for (object_index, object_samples) in frame.object_channels.iter().enumerate() {
                 let source = &self.metadata.dynamic_sources[object_index];
                 render_object_timeslot_to_714(
                     &object_samples[sample_offset..sample_end],
@@ -366,17 +468,101 @@ impl Renderer714 {
                     source,
                 );
             }
+
+            self.metadata_timeslot_phase += timeslot_samples;
+            if self.metadata_timeslot_phase == RENDER_TIMESLOT_SAMPLES {
+                self.metadata_timeslot_phase = 0;
+                self.metadata_timeslot_timecode += RENDER_TIMESLOT_SAMPLES as i32;
+            }
+            sample_offset = sample_end;
         }
 
         if let Some(lfe_lowpass) = self.lfe_lowpass.as_mut() {
             lfe_lowpass.process_in_place(&mut channels[RENDER_714_LFE_INDEX]);
         }
 
-        if !limiter_disabled() {
-            apply_output_limiter(channels, &mut self.limiter_gain, core.sample_rate);
+        Ok(())
+    }
+
+    fn finalize_output(
+        &mut self,
+        channels: Vec<Vec<f32>>,
+        debug: Vec<Render714TimeslotDebug>,
+        sample_rate: u32,
+    ) -> (Vec<Vec<f32>>, Vec<Render714TimeslotDebug>) {
+        if limiter_disabled() {
+            return (channels, debug);
         }
 
-        Ok(())
+        for (pending, channel) in self.limiter_pending.iter_mut().zip(channels.iter()) {
+            pending.extend_from_slice(channel);
+        }
+        self.pending_timeslot_debug.extend(debug);
+        self.take_ready_output(sample_rate)
+    }
+
+    fn take_ready_output(
+        &mut self,
+        sample_rate: u32,
+    ) -> (Vec<Vec<f32>>, Vec<Render714TimeslotDebug>) {
+        let ready_samples = self.limiter_pending.first().map(Vec::len).unwrap_or(0)
+            / RENDER_TIMESLOT_SAMPLES
+            * RENDER_TIMESLOT_SAMPLES;
+
+        if ready_samples == 0 {
+            return (vec![Vec::new(); RENDER_714_CHANNELS], Vec::new());
+        }
+
+        let mut channels = Vec::with_capacity(RENDER_714_CHANNELS);
+        for pending in &mut self.limiter_pending {
+            let remainder = pending.split_off(ready_samples);
+            channels.push(std::mem::replace(pending, remainder));
+        }
+
+        apply_output_limiter_blocks(&mut channels, &mut self.limiter_gain, sample_rate);
+
+        let mut debug = self
+            .pending_timeslot_debug
+            .drain(..ready_samples / RENDER_TIMESLOT_SAMPLES)
+            .collect::<Vec<_>>();
+        for (index, row) in debug.iter_mut().enumerate() {
+            row.sample_offset = index * RENDER_TIMESLOT_SAMPLES;
+        }
+
+        (channels, debug)
+    }
+
+    fn flush_impl(&mut self) -> Option<(Render714Frame, Vec<Render714TimeslotDebug>)> {
+        if limiter_disabled() {
+            return None;
+        }
+
+        let pending_samples = self.limiter_pending.first().map(Vec::len).unwrap_or(0);
+        if pending_samples == 0 {
+            return None;
+        }
+
+        let sample_rate = self.sample_rate?;
+        let mut channels = Vec::with_capacity(RENDER_714_CHANNELS);
+        for pending in &mut self.limiter_pending {
+            channels.push(std::mem::take(pending));
+        }
+
+        apply_output_limiter_partial(&mut channels, &mut self.limiter_gain, sample_rate);
+
+        let mut debug = self.pending_timeslot_debug.drain(..).collect::<Vec<_>>();
+        for (index, row) in debug.iter_mut().enumerate() {
+            row.sample_offset = index * RENDER_TIMESLOT_SAMPLES;
+        }
+
+        Some((
+            Render714Frame {
+                sample_rate,
+                channel_order: RENDER_714_CHANNEL_ORDER.to_vec(),
+                channels,
+            },
+            debug,
+        ))
     }
 
     fn capture_timeslot_debug(&self, sample_offset: usize) -> Render714TimeslotDebug {
@@ -570,15 +756,11 @@ impl OamdRendererState {
         self.dynamic_sources.len()
     }
 
-    fn bed_channels(&self) -> &[BedChannel] {
-        &self.bed_channels
-    }
-
     fn bed_sources(&self) -> &[BedSourceState] {
         &self.bed_sources
     }
 
-    fn update_timeslot(&mut self, timecode: i32) {
+    fn update_timeslot(&mut self, timecode: i32, timeslot_samples: usize) {
         let adjusted = timecode - self.sample_offset;
         let mut element_index = 0usize;
         for index in (0..self.elements.len()).rev() {
@@ -590,6 +772,7 @@ impl OamdRendererState {
         if let Some(element) = self.elements.get_mut(element_index) {
             element.update_sources(
                 adjusted,
+                timeslot_samples,
                 self.bed_or_isf_objects,
                 &mut self.bed_sources,
                 &mut self.dynamic_sources,
@@ -677,6 +860,7 @@ impl ElementRendererState {
     fn update_sources(
         &mut self,
         timecode: i32,
+        timeslot_samples: usize,
         bed_or_isf_objects: usize,
         bed_sources: &mut [BedSourceState],
         dynamic_sources: &mut [DynamicSourceState],
@@ -712,7 +896,7 @@ impl ElementRendererState {
         }
 
         if self.future_distance > 0 {
-            let t = (RENDER_TIMESLOT_SAMPLES as f32 / self.future_distance as f32).min(1.0);
+            let t = (timeslot_samples as f32 / self.future_distance as f32).min(1.0);
             for (dynamic_index, source) in dynamic_sources.iter_mut().enumerate() {
                 if self.update_now[dynamic_index] {
                     source.cubical_position =
@@ -724,7 +908,7 @@ impl ElementRendererState {
                     source.position_valid = true;
                 }
             }
-            self.future_distance -= RENDER_TIMESLOT_SAMPLES as i32;
+            self.future_distance -= timeslot_samples as i32;
         }
     }
 }
@@ -862,38 +1046,50 @@ impl ObjectInfoBlockState {
 }
 
 fn mix_bed_objects_to_714(
-    frame: &CorePcmFrame,
-    bed_channels: &[BedChannel],
+    input_bed_channels: &[RenderInputChannelRef<'_>],
+    metadata_bed_channels: &[BedChannel],
     bed_sources: &[BedSourceState],
     output: &mut [Vec<f32>],
 ) -> Result<(), Render714Error> {
-    for (channel, source) in bed_channels.iter().copied().zip(bed_sources.iter()) {
-        let output_channel = map_bed_channel_to_714(channel)
-            .ok_or(Render714Error::UnsupportedBedChannel(channel))?;
-        match channel {
-            BedChannel::LowFrequencyEffects => {
-                if let Some(lfe) = frame.lfe_channel.as_ref() {
-                    mix_full_channel(
-                        lfe,
-                        &mut output[output_channel],
-                        source.gain * LFE_SEND_MINUS_10_DB,
-                    );
-                }
-            }
-            _ => {
-                let Some(source_index) = frame
-                    .fullband_channel_order
+    if metadata_bed_channels.len() != bed_sources.len() {
+        return Err(Render714Error::BedChannelCountMismatch {
+            expected: metadata_bed_channels.len(),
+            provided: bed_sources.len(),
+        });
+    }
+
+    for (bed_channel, source) in metadata_bed_channels
+        .iter()
+        .copied()
+        .zip(bed_sources.iter())
+    {
+        let input_channel = input_bed_channels
+            .iter()
+            .copied()
+            .find(|channel| channel.channel == bed_channel)
+            .ok_or(Render714Error::BedChannelCountMismatch {
+                expected: metadata_bed_channels
                     .iter()
-                    .position(|candidate| *candidate == channel)
-                else {
-                    return Err(Render714Error::UnsupportedBedChannel(channel));
-                };
-                mix_full_channel(
-                    &frame.fullband_channels[source_index],
-                    &mut output[output_channel],
-                    source.gain,
-                );
-            }
+                    .filter(|candidate| **candidate == bed_channel)
+                    .count(),
+                provided: input_bed_channels
+                    .iter()
+                    .filter(|candidate| candidate.channel == bed_channel)
+                    .count(),
+            })?;
+        let output_channel = map_bed_channel_to_714(bed_channel)
+            .ok_or(Render714Error::UnsupportedBedChannel(bed_channel))?;
+        match bed_channel {
+            BedChannel::LowFrequencyEffects => mix_full_channel(
+                input_channel.samples,
+                &mut output[output_channel],
+                source.gain * LFE_SEND_MINUS_10_DB,
+            ),
+            _ => mix_full_channel(
+                input_channel.samples,
+                &mut output[output_channel],
+                source.gain,
+            ),
         }
     }
     Ok(())
@@ -1351,36 +1547,74 @@ fn fix_incomplete_layer(
 }
 
 fn ratio(a: f32, b: f32, x: f32) -> f32 {
-    if a == b { 0.0 } else { (x - a) / (b - a) }
+    if a == b {
+        0.0
+    } else {
+        (x - a) / (b - a)
+    }
 }
 
+#[cfg(test)]
 fn apply_output_limiter(channels: &mut [Vec<f32>], last_gain: &mut f32, sample_rate: u32) {
+    apply_output_limiter_blocks(channels, last_gain, sample_rate);
+}
+
+fn apply_output_limiter_blocks(channels: &mut [Vec<f32>], last_gain: &mut f32, sample_rate: u32) {
     let Some(samples) = channels.first().map(Vec::len) else {
         return;
     };
+    debug_assert_eq!(samples % RENDER_TIMESLOT_SAMPLES, 0);
 
-    let decay = RENDER_TIMESLOT_SAMPLES as f32 / sample_rate as f32;
-    for block_start in (0..samples).step_by(RENDER_TIMESLOT_SAMPLES) {
-        let block_end = (block_start + RENDER_TIMESLOT_SAMPLES).min(samples);
-        let mut max = 0.0f32;
-        for channel in channels.iter() {
-            max = max.max(max_abs_slice(&channel[block_start..block_end]));
-        }
+    let mut block_start = 0usize;
+    while block_start < samples {
+        apply_output_limiter_block(
+            channels,
+            last_gain,
+            sample_rate,
+            block_start,
+            block_start + RENDER_TIMESLOT_SAMPLES,
+        );
+        block_start += RENDER_TIMESLOT_SAMPLES;
+    }
+}
 
-        if max * *last_gain > 1.0 {
-            *last_gain = 0.9 / max;
-        }
+fn apply_output_limiter_partial(channels: &mut [Vec<f32>], last_gain: &mut f32, sample_rate: u32) {
+    let Some(samples) = channels.first().map(Vec::len) else {
+        return;
+    };
+    if samples == 0 {
+        return;
+    }
 
-        if *last_gain != 1.0 {
-            for channel in channels.iter_mut() {
-                scale_slice_in_place(&mut channel[block_start..block_end], *last_gain);
-            }
-        }
+    apply_output_limiter_block(channels, last_gain, sample_rate, 0, samples);
+}
 
-        *last_gain += decay;
-        if *last_gain > 1.0 {
-            *last_gain = 1.0;
+fn apply_output_limiter_block(
+    channels: &mut [Vec<f32>],
+    last_gain: &mut f32,
+    sample_rate: u32,
+    block_start: usize,
+    block_end: usize,
+) {
+    let decay = (block_end - block_start) as f32 / sample_rate as f32;
+    let mut max = 0.0f32;
+    for channel in channels.iter() {
+        max = max.max(max_abs_slice(&channel[block_start..block_end]));
+    }
+
+    if max * *last_gain > 1.0 {
+        *last_gain = 0.9 / max;
+    }
+
+    if *last_gain != 1.0 {
+        for channel in channels.iter_mut() {
+            scale_slice_in_place(&mut channel[block_start..block_end], *last_gain);
         }
+    }
+
+    *last_gain += decay;
+    if *last_gain > 1.0 {
+        *last_gain = 1.0;
     }
 }
 
@@ -1614,14 +1848,98 @@ fn vec_length(vector: Vec3) -> f32 {
     (vector.x * vector.x + vector.y * vector.y + vector.z * vector.z).sqrt()
 }
 
+fn render_input_from_frame<'a>(
+    frame: &'a RenderInputFrame,
+    bed_channels: &'a mut Vec<RenderInputChannelRef<'a>>,
+    object_channels: &'a mut Vec<&'a [f32]>,
+) -> RenderInputFrameRef<'a> {
+    bed_channels.clear();
+    bed_channels.reserve(frame.bed_channels.len());
+    for channel in &frame.bed_channels {
+        bed_channels.push(RenderInputChannelRef {
+            channel: channel.channel,
+            samples: &channel.samples,
+        });
+    }
+
+    object_channels.clear();
+    object_channels.reserve(frame.object_channels.len());
+    for channel in &frame.object_channels {
+        object_channels.push(channel.as_slice());
+    }
+
+    RenderInputFrameRef {
+        sample_rate: frame.sample_rate,
+        bed_channels,
+        object_channels,
+        oamd: frame.oamd.as_ref(),
+        oamd_sample_offset: frame.oamd_sample_offset,
+    }
+}
+
+fn validate_render_input_sample_counts(
+    frame: &RenderInputFrameRef<'_>,
+) -> Result<usize, Render714Error> {
+    let samples = frame.samples_per_channel();
+
+    for channel in frame.bed_channels {
+        if channel.samples.len() != samples {
+            return Err(Render714Error::UnsupportedSampleCount(
+                channel.samples.len(),
+            ));
+        }
+    }
+
+    for channel in frame.object_channels {
+        if channel.len() != samples {
+            return Err(Render714Error::UnsupportedSampleCount(channel.len()));
+        }
+    }
+
+    Ok(samples)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        BedSourceState, DynamicSourceState, ElementRendererState, ObjectInfoBlockState,
-        RENDER_714_CHANNEL_ORDER, RENDER_714_CHANNELS, apply_output_limiter,
-        map_bed_channel_to_714,
+        apply_output_limiter, map_bed_channel_to_714, mix_bed_objects_to_714, BedSourceState,
+        DynamicSourceState, ElementRendererState, ObjectInfoBlockState, Render714Frame,
+        RenderInputChannel, RenderInputChannelRef, RenderInputFrame, Renderer714,
+        RENDER_714_CHANNELS, RENDER_714_CHANNEL_ORDER,
     };
-    use crate::metadata::BedChannel;
+    use crate::metadata::{
+        BedChannel, OamdBlockUpdate, OamdElement, OamdElementKind, OamdObjectBlock,
+        OamdObjectElement, OamdPayload, Vec3,
+    };
+
+    fn concat_rendered_frames(frames: &[Render714Frame]) -> Vec<Vec<f32>> {
+        let mut merged = vec![Vec::new(); RENDER_714_CHANNELS];
+        for frame in frames {
+            for (output, channel) in merged.iter_mut().zip(frame.channels.iter()) {
+                output.extend_from_slice(channel);
+            }
+        }
+        merged
+    }
+
+    fn assert_channels_close(actual: &[Vec<f32>], expected: &[Vec<f32>]) {
+        assert_eq!(actual.len(), expected.len());
+        for (channel_index, (actual_channel, expected_channel)) in
+            actual.iter().zip(expected.iter()).enumerate()
+        {
+            assert_eq!(actual_channel.len(), expected_channel.len());
+            for (sample_index, (actual_sample, expected_sample)) in actual_channel
+                .iter()
+                .zip(expected_channel.iter())
+                .enumerate()
+            {
+                assert!(
+                    (actual_sample - expected_sample).abs() < 1e-6,
+                    "channel={channel_index} sample={sample_index} actual={actual_sample} expected={expected_sample}",
+                );
+            }
+        }
+    }
 
     #[test]
     fn render_714_channel_order_is_stable() {
@@ -1658,7 +1976,7 @@ mod tests {
         let mut bed_sources = vec![BedSourceState::default()];
         let mut dynamic_sources = vec![DynamicSourceState::default(); 0];
 
-        element.update_sources(1, 1, &mut bed_sources, &mut dynamic_sources);
+        element.update_sources(1, 64, 1, &mut bed_sources, &mut dynamic_sources);
 
         assert_eq!(bed_sources[0].gain, 0.5);
     }
@@ -1673,5 +1991,352 @@ mod tests {
         assert!((channels[0][0] - 0.9).abs() < 1e-6);
         assert!((channels[1][0] - 0.225).abs() < 1e-6);
         assert!((gain - 0.451_333_34).abs() < 1e-6);
+    }
+
+    #[test]
+    fn generic_render_input_accepts_non_timeslot_aligned_lengths() {
+        let frame = RenderInputFrame {
+            sample_rate: 48_000,
+            bed_channels: vec![RenderInputChannel {
+                channel: BedChannel::FrontLeft,
+                samples: vec![0.25; 65],
+            }],
+            object_channels: Vec::new(),
+            oamd: Some(OamdPayload {
+                version: 0,
+                object_count: 1,
+                alternate_object_present: false,
+                element_count: 0,
+                beds: 1,
+                bed_instances: 1,
+                bed_or_isf_objects: 1,
+                dynamic_objects: 0,
+                isf_in_use: false,
+                isf_index: None,
+                bed_assignment: vec![vec![BedChannel::FrontLeft]],
+                elements: Vec::new(),
+            }),
+            oamd_sample_offset: Some(0),
+        };
+
+        let mut renderer = Renderer714::new();
+        let rendered = renderer
+            .push_frame(&frame)
+            .expect("non-timeslot-aligned input should render");
+        let flushed = renderer
+            .flush()
+            .expect("trailing partial block should be flushable");
+
+        assert_eq!(rendered.samples_per_channel(), 64);
+        assert_eq!(rendered.channels[0].len(), 64);
+        assert_eq!(flushed.samples_per_channel(), 1);
+        assert_eq!(flushed.channels[0].len(), 1);
+    }
+
+    #[test]
+    fn generic_render_input_rejects_mismatched_channel_lengths() {
+        let frame = RenderInputFrame {
+            sample_rate: 48_000,
+            bed_channels: vec![
+                RenderInputChannel {
+                    channel: BedChannel::FrontLeft,
+                    samples: vec![0.25; 65],
+                },
+                RenderInputChannel {
+                    channel: BedChannel::FrontRight,
+                    samples: vec![0.25; 64],
+                },
+            ],
+            object_channels: Vec::new(),
+            oamd: Some(OamdPayload {
+                version: 0,
+                object_count: 2,
+                alternate_object_present: false,
+                element_count: 0,
+                beds: 2,
+                bed_instances: 1,
+                bed_or_isf_objects: 2,
+                dynamic_objects: 0,
+                isf_in_use: false,
+                isf_index: None,
+                bed_assignment: vec![vec![BedChannel::FrontLeft, BedChannel::FrontRight]],
+                elements: Vec::new(),
+            }),
+            oamd_sample_offset: Some(0),
+        };
+
+        let err = Renderer714::new()
+            .push_frame(&frame)
+            .expect_err("mismatched channel lengths should fail");
+        assert_eq!(err.to_string(), "unsupported-sample-count 64");
+    }
+
+    #[test]
+    fn mix_bed_objects_matches_sources_by_channel_label() {
+        let input_bed_channels = [
+            RenderInputChannelRef {
+                channel: BedChannel::FrontRight,
+                samples: &[1.0],
+            },
+            RenderInputChannelRef {
+                channel: BedChannel::FrontLeft,
+                samples: &[2.0],
+            },
+        ];
+        let metadata_bed_channels = [BedChannel::FrontLeft, BedChannel::FrontRight];
+        let bed_sources = vec![BedSourceState { gain: 0.5 }, BedSourceState { gain: 0.25 }];
+        let mut output = vec![vec![0.0; 1]; RENDER_714_CHANNELS];
+
+        mix_bed_objects_to_714(
+            &input_bed_channels,
+            &metadata_bed_channels,
+            &bed_sources,
+            &mut output,
+        )
+        .expect("reordered labels should render");
+
+        assert_eq!(output[0][0], 1.0);
+        assert_eq!(output[1][0], 0.25);
+    }
+
+    #[test]
+    fn mix_bed_objects_reuses_labeled_input_for_duplicate_metadata_beds() {
+        let input_bed_channels = [RenderInputChannelRef {
+            channel: BedChannel::FrontLeft,
+            samples: &[2.0],
+        }];
+        let metadata_bed_channels = [BedChannel::FrontLeft, BedChannel::FrontLeft];
+        let bed_sources = vec![BedSourceState { gain: 0.5 }, BedSourceState { gain: 0.25 }];
+        let mut output = vec![vec![0.0; 1]; RENDER_714_CHANNELS];
+
+        mix_bed_objects_to_714(
+            &input_bed_channels,
+            &metadata_bed_channels,
+            &bed_sources,
+            &mut output,
+        )
+        .expect("duplicate metadata beds should reuse the labeled input");
+
+        assert_eq!(output[0][0], 1.5);
+    }
+
+    #[test]
+    fn split_render_matches_unsplit_render_with_non_aligned_chunks() {
+        fn test_oamd_payload() -> OamdPayload {
+            let block0 = OamdObjectBlock {
+                basic_info_status: 1,
+                gain: Some(0.2),
+                ..OamdObjectBlock::default()
+            };
+            let block1 = OamdObjectBlock {
+                basic_info_status: 1,
+                gain: Some(0.8),
+                ..OamdObjectBlock::default()
+            };
+            OamdPayload {
+                version: 0,
+                object_count: 1,
+                alternate_object_present: false,
+                element_count: 1,
+                beds: 0,
+                bed_instances: 0,
+                bed_or_isf_objects: 0,
+                dynamic_objects: 1,
+                isf_in_use: false,
+                isf_index: None,
+                bed_assignment: Vec::new(),
+                elements: vec![OamdElement {
+                    element_index: 0,
+                    byte_length: 0,
+                    kind: OamdElementKind::Object(OamdObjectElement {
+                        sample_offset: 0,
+                        block_updates: vec![
+                            OamdBlockUpdate {
+                                offset: 0,
+                                ramp_duration: 0,
+                            },
+                            OamdBlockUpdate {
+                                offset: 64,
+                                ramp_duration: 0,
+                            },
+                        ],
+                        object_blocks: vec![vec![block0, block1]],
+                    }),
+                }],
+            }
+        }
+
+        fn test_frame(samples: usize, oamd: Option<OamdPayload>) -> RenderInputFrame {
+            let oamd_sample_offset = oamd.as_ref().map(|_| 0);
+            RenderInputFrame {
+                sample_rate: 48_000,
+                bed_channels: Vec::new(),
+                object_channels: vec![vec![1.0; samples]],
+                oamd,
+                oamd_sample_offset,
+            }
+        }
+
+        let payload = test_oamd_payload();
+
+        let mut unsplit_renderer = Renderer714::new();
+        let unsplit = unsplit_renderer
+            .push_frame(&test_frame(192, Some(payload.clone())))
+            .expect("unsplit render should succeed");
+
+        let mut split_renderer = Renderer714::new();
+        let split_a = split_renderer
+            .push_frame(&test_frame(65, Some(payload)))
+            .expect("first split render should succeed");
+        let split_b = split_renderer
+            .push_frame(&test_frame(127, None))
+            .expect("second split render should succeed");
+
+        let split = concat_rendered_frames(&[split_a, split_b]);
+        assert_channels_close(&split, &unsplit.channels);
+    }
+
+    #[test]
+    fn split_render_matches_unsplit_render_when_object_ramp_spans_partial_timeslot() {
+        fn test_oamd_payload() -> OamdPayload {
+            let left = OamdObjectBlock {
+                basic_info_status: 1,
+                gain: Some(1.0),
+                render_info_status: 1,
+                position: Some(Vec3 {
+                    x: 0.0,
+                    y: 0.5,
+                    z: 0.5,
+                }),
+                ..OamdObjectBlock::default()
+            };
+            let right = OamdObjectBlock {
+                basic_info_status: 1,
+                gain: Some(1.0),
+                render_info_status: 1,
+                position: Some(Vec3 {
+                    x: 1.0,
+                    y: 0.5,
+                    z: 0.5,
+                }),
+                ..OamdObjectBlock::default()
+            };
+            OamdPayload {
+                version: 0,
+                object_count: 1,
+                alternate_object_present: false,
+                element_count: 1,
+                beds: 0,
+                bed_instances: 0,
+                bed_or_isf_objects: 0,
+                dynamic_objects: 1,
+                isf_in_use: false,
+                isf_index: None,
+                bed_assignment: Vec::new(),
+                elements: vec![OamdElement {
+                    element_index: 0,
+                    byte_length: 0,
+                    kind: OamdElementKind::Object(OamdObjectElement {
+                        sample_offset: 0,
+                        block_updates: vec![
+                            OamdBlockUpdate {
+                                offset: 0,
+                                ramp_duration: 0,
+                            },
+                            OamdBlockUpdate {
+                                offset: 64,
+                                ramp_duration: 128,
+                            },
+                        ],
+                        object_blocks: vec![vec![left, right]],
+                    }),
+                }],
+            }
+        }
+
+        fn test_frame(samples: usize, oamd: Option<OamdPayload>) -> RenderInputFrame {
+            let oamd_sample_offset = oamd.as_ref().map(|_| 0);
+            RenderInputFrame {
+                sample_rate: 48_000,
+                bed_channels: Vec::new(),
+                object_channels: vec![vec![1.0; samples]],
+                oamd,
+                oamd_sample_offset,
+            }
+        }
+
+        let payload = test_oamd_payload();
+
+        let mut unsplit_renderer = Renderer714::new();
+        let unsplit = unsplit_renderer
+            .push_frame(&test_frame(192, Some(payload.clone())))
+            .expect("unsplit render should succeed");
+
+        let mut split_renderer = Renderer714::new();
+        let split_a = split_renderer
+            .push_frame(&test_frame(160, Some(payload)))
+            .expect("first split render should succeed");
+        let split_b = split_renderer
+            .push_frame(&test_frame(32, None))
+            .expect("second split render should succeed");
+
+        let split = concat_rendered_frames(&[split_a, split_b]);
+        assert_channels_close(&split, &unsplit.channels);
+    }
+
+    #[test]
+    fn split_render_matches_unsplit_render_when_limiter_peak_arrives_late() {
+        fn bed_payload() -> OamdPayload {
+            OamdPayload {
+                version: 0,
+                object_count: 1,
+                alternate_object_present: false,
+                element_count: 0,
+                beds: 1,
+                bed_instances: 1,
+                bed_or_isf_objects: 1,
+                dynamic_objects: 0,
+                isf_in_use: false,
+                isf_index: None,
+                bed_assignment: vec![vec![BedChannel::FrontLeft]],
+                elements: Vec::new(),
+            }
+        }
+
+        fn bed_frame(samples: Vec<f32>, oamd: Option<OamdPayload>) -> RenderInputFrame {
+            let oamd_sample_offset = oamd.as_ref().map(|_| 0);
+            RenderInputFrame {
+                sample_rate: 48_000,
+                bed_channels: vec![RenderInputChannel {
+                    channel: BedChannel::FrontLeft,
+                    samples,
+                }],
+                object_channels: Vec::new(),
+                oamd,
+                oamd_sample_offset,
+            }
+        }
+
+        let mut samples = vec![0.4; 32];
+        samples.extend(vec![2.0; 32]);
+
+        let payload = bed_payload();
+
+        let mut unsplit_renderer = Renderer714::new();
+        let unsplit = unsplit_renderer
+            .push_frame(&bed_frame(samples.clone(), Some(payload.clone())))
+            .expect("unsplit render should succeed");
+
+        let mut split_renderer = Renderer714::new();
+        let split_a = split_renderer
+            .push_frame(&bed_frame(samples[..32].to_vec(), Some(payload)))
+            .expect("first split render should succeed");
+        let split_b = split_renderer
+            .push_frame(&bed_frame(samples[32..].to_vec(), None))
+            .expect("second split render should succeed");
+
+        assert_eq!(split_a.samples_per_channel(), 0);
+        let split = concat_rendered_frames(&[split_a, split_b]);
+        assert_channels_close(&split, &unsplit.channels);
     }
 }

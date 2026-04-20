@@ -8,7 +8,7 @@
 //!   state in sync.
 //! - [`PcmDecoder`] adds decoded core PCM channels.
 //! - [`ObjectPcmDecoder`] adds decoded object PCM plus the parsed object metadata payloads.
-//! - [`Renderer714`] turns [`ObjectPcmFrame`] values into 7.1.4 float PCM.
+//! - [`Renderer714`] turns [`RenderInputFrame`] values into 7.1.4 float PCM.
 //!
 //! All decoders are stateful. Feed complete access units in stream order and call `reset()` after
 //! seeks, discontinuities, or when you intentionally drop intermediate packets.
@@ -17,14 +17,15 @@
 //!
 //! ```no_run
 //! use std::fs;
-//! use starmine_ad::{ObjectPcmDecoder, Renderer714};
+//! use starmine_ad::{ObjectPcmDecoder, RenderInputFrame, Renderer714};
 //!
 //! let access_unit = fs::read("frame.eac3")?;
 //! let mut decoder = ObjectPcmDecoder::new();
 //! let mut renderer = Renderer714::new();
 //!
 //! if let Some(result) = decoder.push_access_unit(&access_unit)? {
-//!     let rendered = renderer.push_frame(&result.pcm)?;
+//!     let input: RenderInputFrame = result.pcm.into();
+//!     let rendered = renderer.push_frame(&input)?;
 //!     assert_eq!(rendered.channel_count(), 12);
 //! }
 //! # Ok::<(), Box<dyn std::error::Error>>(())
@@ -71,7 +72,7 @@ pub use pcm::{
 };
 pub use render::{
     RENDER_714_CHANNEL_ORDER, Render714Error, Render714Frame, Render714SourceDebug,
-    Render714TimeslotDebug, Renderer714,
+    Render714TimeslotDebug, RenderInputChannel, RenderInputFrame, Renderer714,
 };
 pub use syncframe::{
     AccessUnitInfo, AuxParseStatus, EmdfBlockInfo, EmdfPayloadInfo, FrameType, ParseError,

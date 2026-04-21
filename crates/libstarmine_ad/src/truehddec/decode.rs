@@ -1,11 +1,12 @@
 use crate::truehddec::process::{MAX_PRESENTATIONS, PresentationMap, PresentationType};
+use crate::truehddec::simd::{dot_product_i32_prefix, dual_dot_product_i32_prefix};
 use crate::truehddec::structs::access_unit::AccessUnit;
+use crate::truehddec::structs::block::Block;
 use crate::truehddec::structs::channel::ChannelLabel;
 use crate::truehddec::structs::oamd::ObjectAudioMetadataPayload;
-use crate::truehddec::utils::dither::dither_31eb;
+use crate::truehddec::utils::dither::fill_dither_31eb;
 use crate::truehddec::utils::errors::{DecodeError, Result};
 use log::{info, trace};
-use std::collections::VecDeque;
 
 /// Decodes access units to PCM audio samples.
 ///
@@ -18,29 +19,34 @@ pub struct Decoder {
 impl Decoder {
     /// Decodes an access unit to PCM audio samples.
     ///
-    /// Returns a [`DecodedAccessUnit`] containing 24-bit PCM samples organized
-    /// as `[sample_index][channel_index]` with up to 160 samples and 16 channels.
+    /// Updates the internal decode state for the requested presentation.
     pub fn decode_presentation(
         &mut self,
         access_unit: &AccessUnit,
         presentation: usize,
-    ) -> Result<DecodedAccessUnit> {
+    ) -> Result<()> {
         self.state.decode_access_unit(access_unit, presentation)?;
-        let decoded = DecodedAccessUnit {
-            channel_labels: self.state.channel_labels.clone(),
-            sampling_frequency: self.state.sampling_frequency,
-            sample_length: self.state.samples_per_au - self.state.zero_samples,
-            channel_count: self.state.substream_state[self.state.presentation].max_matrix_chan + 1,
-            pcm_data: self.state.output_buffer,
-            oamd: self.state.oamd.iter().cloned().collect::<Vec<_>>(),
-            is_duplicate: self.state.has_duplicate_timing && self.state.has_duplicate_sample,
-            substream_info_changed: self.state.substream_info_changed,
-        };
+        Ok(())
+    }
 
-        // Reset the flag after reading it
+    /// Borrows the most recently decoded PCM view from the decoder state.
+    pub fn decoded_access_unit(&mut self) -> DecodedAccessUnit<'_> {
+        let sample_length = self.state.samples_per_au - self.state.zero_samples;
+        let channel_count = self.state.substream_state[self.state.presentation].max_matrix_chan + 1;
+        let is_duplicate = self.state.has_duplicate_timing && self.state.has_duplicate_sample;
+        let substream_info_changed = self.state.substream_info_changed;
         self.state.substream_info_changed = false;
 
-        Ok(decoded)
+        DecodedAccessUnit {
+            sampling_frequency: self.state.sampling_frequency,
+            sample_length,
+            channel_count,
+            pcm_data: &self.state.output_buffer,
+            channel_labels: &self.state.channel_labels,
+            oamd: &self.state.oamd,
+            is_duplicate,
+            substream_info_changed,
+        }
     }
 
     /// Sets the failure level for validation errors.
@@ -57,7 +63,7 @@ impl Decoder {
 /// Contains 24-bit signed integer samples in sample-major ordering
 /// (`pcm_data[sample_index][channel_index]`) with associated metadata.
 #[derive(Debug)]
-pub struct DecodedAccessUnit {
+pub struct DecodedAccessUnit<'a> {
     /// Sampling frequency in Hz.
     ///
     /// This is the sampling frequency used for the audio data.
@@ -81,18 +87,18 @@ pub struct DecodedAccessUnit {
     /// - Array dimensions: [160 samples][16 channels]
     /// - Valid data length: Determined by `sample_length`
     /// - Channel count: Determined by stream configuration
-    pub pcm_data: [[i32; 16]; 160],
+    pub pcm_data: &'a [[i32; 16]; 160],
 
     /// Channel labels for the audio data.
     ///
     /// Contains labels for each channel in the audio data, providing
     /// descriptive names for each channel.
-    pub channel_labels: Vec<ChannelLabel>,
+    pub channel_labels: &'a [ChannelLabel],
 
     /// Optional object audio metadata payload.
     ///
     /// Contains spatial audio metadata when present in the stream.
-    pub oamd: Vec<ObjectAudioMetadataPayload>,
+    pub oamd: &'a [ObjectAudioMetadataPayload],
 
     /// Indicates whether this access unit is a duplicate of the previous one.
     ///
@@ -142,8 +148,6 @@ pub struct DecoderSubstreamState {
     pub coeff: [[[i32; 8]; 16]; 2],
     pub coeff_state: [[[i32; 8]; 16]; 2],
 
-    pub bypassed_lsb: [[i32; 16]; 160],
-    pub block_data: [[i32; 16]; 160],
     pub dither_table: [i32; 256],
     pub decoded_sample_len: usize,
 }
@@ -182,8 +186,6 @@ impl Default for DecoderSubstreamState {
             coeff: [[[0; 8]; 16]; 2],
             coeff_state: [[[0; 8]; 16]; 2],
 
-            bypassed_lsb: [[0; 16]; 160],
-            block_data: [[0; 16]; 160],
             dither_table: [0; 256],
             decoded_sample_len: 0,
         }
@@ -220,7 +222,7 @@ pub struct DecoderState {
     pub rematrix_buffer: [[i32; 16]; 160],
     pub output_buffer: [[i32; 16]; 160],
     pub zero_samples: usize,
-    pub oamd: VecDeque<ObjectAudioMetadataPayload>,
+    pub oamd: Vec<ObjectAudioMetadataPayload>,
     pub substream_info_changed: bool,
 }
 
@@ -247,7 +249,7 @@ impl Default for DecoderState {
             rematrix_buffer: [[0; 16]; 160],
             output_buffer: [[0; 16]; 160],
             zero_samples: 0,
-            oamd: VecDeque::with_capacity(4),
+            oamd: Vec::with_capacity(4),
             substream_info_changed: false,
         }
     }
@@ -303,7 +305,7 @@ impl DecoderState {
                         let mut oamd =
                             ObjectAudioMetadataPayload::read(&evo_payload.evo_payload_byte)?;
                         oamd.evo_sample_offset = smploffst;
-                        self.oamd.push_back(oamd);
+                        self.oamd.push(oamd);
                     }
                 }
             }
@@ -312,9 +314,9 @@ impl DecoderState {
             let ss_state = &mut self.substream_state[self.substream_index];
             ss_state.decoded_sample_len = 0;
 
-            for block in substream_segment.block.iter() {
+            for block in &substream_segment.block {
                 block.update_decoder_state(self)?;
-                self.decode()?;
+                self.decode(block)?;
             }
         }
 
@@ -371,7 +373,7 @@ impl DecoderState {
         }
     }
 
-    fn decode(&mut self) -> Result<()> {
+    fn decode(&mut self, block: &Block) -> Result<()> {
         let DecoderSubstreamState {
             restart_sync_word,
             min_chan,
@@ -403,9 +405,10 @@ impl DecoderState {
 
         let decoded_sample_len = &mut ss_state.decoded_sample_len;
         let dither_seed = &mut ss_state.dither_seed;
-        let bypassed_lsb = &mut ss_state.bypassed_lsb;
         let coeff_state = &mut ss_state.coeff_state;
         let m_coeff = &mut ss_state.m_coeff;
+        let block_data = &block.block_data;
+        let bypassed_lsb = &block.bypassed_lsb;
 
         let (max_val, min_val) = if restart_sync_word == 0x31EC {
             (1 << 31, -(1 << 31))
@@ -415,16 +418,12 @@ impl DecoderState {
 
         // recorrelation
         {
-            let block_data = &ss_state.block_data;
             let rematrix_buffer = &mut self.rematrix_buffer[*decoded_sample_len..];
 
             #[allow(clippy::needless_range_loop)]
             for chi in min_chan..=max_chan {
-                let mut state_buffer = [[0; 168]; 2];
-
-                state_buffer[0][160..].copy_from_slice(&coeff_state[0][chi]);
-                state_buffer[1][160..].copy_from_slice(&coeff_state[1][chi]);
-
+                let mut fir_history = coeff_state[0][chi];
+                let mut iir_history = coeff_state[1][chi];
                 let fir_order = order[0][chi];
                 let iir_order = order[1][chi];
                 let coeff_q_shift = coeff_q[0][chi];
@@ -434,17 +433,8 @@ impl DecoderState {
 
                 for blki in 0..block_size {
                     let audio_data = block_data[blki][chi] as i64;
-                    let state_base = 160 - blki;
-
-                    let mut acc = 0i64;
-
-                    for oi in 0..fir_order {
-                        acc += (fir_coeff[oi] as i64) * (state_buffer[0][state_base + oi] as i64);
-                    }
-
-                    for oi in 0..iir_order {
-                        acc += (iir_coeff[oi] as i64) * (state_buffer[1][state_base + oi] as i64);
-                    }
+                    let acc = dot_product_i32_prefix(fir_coeff, &fir_history, fir_order)
+                        + dot_product_i32_prefix(iir_coeff, &iir_history, iir_order);
 
                     let pred = acc >> coeff_q_shift;
                     let fir_state = audio_data + (pred & quantiser_mask);
@@ -464,14 +454,15 @@ impl DecoderState {
                         }
                     }
 
-                    state_buffer[0][159 - blki] = fir_state as i32;
-                    state_buffer[1][159 - blki] = iir_state as i32;
-
-                    rematrix_buffer[blki][chi] = fir_state as i32;
+                    let fir_state = fir_state as i32;
+                    let iir_state = iir_state as i32;
+                    push_history_front(&mut fir_history, fir_state);
+                    push_history_front(&mut iir_history, iir_state);
+                    rematrix_buffer[blki][chi] = fir_state;
                 }
 
-                coeff_state[0][chi][..].copy_from_slice(&state_buffer[0][160 - block_size..][..8]);
-                coeff_state[1][chi][..].copy_from_slice(&state_buffer[1][160 - block_size..][..8]);
+                coeff_state[0][chi] = fir_history;
+                coeff_state[1][chi] = iir_history;
             }
         }
 
@@ -484,7 +475,7 @@ impl DecoderState {
                 0x31EA => {
                     for blki in 0..block_size {
                         let rematrix_buffer = &mut rematrix_buffer[blki];
-                        let bypassed_lsb = &mut bypassed_lsb[blki];
+                        let bypassed_lsb = &bypassed_lsb[blki];
                         let dither_seed_shr7 = *dither_seed >> 7;
 
                         rematrix_buffer[max_matrix_chan + 1] =
@@ -497,13 +488,12 @@ impl DecoderState {
                                 & 0x7FFFFF;
 
                         for pmi in 0..primitive_matrices {
-                            let mut acc = 0;
                             let matrix_ch = matrix_ch[pmi] as usize;
-                            let m_coeff = &m_coeff[pmi];
-
-                            for chi in 0..=max_matrix_chan + 2 {
-                                acc += rematrix_buffer[chi] as i64 * m_coeff[chi] as i64;
-                            }
+                            let acc = dot_product_i32_prefix(
+                                rematrix_buffer,
+                                &m_coeff[pmi],
+                                max_matrix_chan + 3,
+                            );
 
                             rematrix_buffer[matrix_ch] = (((acc >> 18) as i32)
                                 & (!((1 << quantiser_step_size[matrix_ch]) - 1)))
@@ -513,29 +503,28 @@ impl DecoderState {
                 }
                 0x31EB => {
                     if *decoded_sample_len == 0 {
-                        dither_table[..samples_per_au.next_power_of_two()]
-                            .copy_from_slice(&dither_31eb(samples_per_au, dither_seed));
+                        let dither_len = samples_per_au.next_power_of_two();
+                        fill_dither_31eb(&mut dither_table[..dither_len], dither_seed);
                     }
 
                     let dither_index_mask = samples_per_au.next_power_of_two() - 1;
 
                     for blki in 0..block_size {
                         let rematrix_buffer = &mut rematrix_buffer[blki];
-                        let bypassed_lsb = &mut bypassed_lsb[blki];
+                        let bypassed_lsb = &bypassed_lsb[blki];
                         let blki_abs = blki + *decoded_sample_len;
 
                         for pmi in 0..primitive_matrices {
-                            let mut acc = 0;
-                            let m_coeff = &m_coeff[pmi];
                             let dither_scale = dither_scale[pmi] as i64;
                             let matrix_ch = matrix_ch[pmi] as usize;
+                            let mut acc = dot_product_i32_prefix(
+                                rematrix_buffer,
+                                &m_coeff[pmi],
+                                max_matrix_chan + 1,
+                            );
 
                             let dither_index =
                                 (primitive_matrices - pmi) * (2 * blki_abs + 1) + blki_abs;
-
-                            for chi in 0..=max_matrix_chan {
-                                acc += rematrix_buffer[chi] as i64 * m_coeff[chi] as i64;
-                            }
 
                             if dither_scale != 0 {
                                 acc += (dither_table[dither_index & dither_index_mask] as i64)
@@ -550,8 +539,8 @@ impl DecoderState {
                 }
                 0x31EC => {
                     if *decoded_sample_len == 0 {
-                        dither_table[..samples_per_au.next_power_of_two()]
-                            .copy_from_slice(&dither_31eb(samples_per_au, dither_seed));
+                        let dither_len = samples_per_au.next_power_of_two();
+                        fill_dither_31eb(&mut dither_table[..dither_len], dither_seed);
                     }
 
                     let dither_index_mask = samples_per_au.next_power_of_two() - 1;
@@ -560,24 +549,21 @@ impl DecoderState {
 
                     for blki in 0..block_size {
                         let rematrix_buffer = &mut rematrix_buffer[blki];
-                        let bypassed_lsb = &mut bypassed_lsb[blki];
+                        let bypassed_lsb = &bypassed_lsb[blki];
                         let blki_abs = blki + *decoded_sample_len;
 
                         for pmi in 0..primitive_matrices {
-                            let mut acc = 0;
-                            let mut acc_delta = 0;
                             let dither_scale = dither_scale[pmi] as u64;
                             let matrix_ch = matrix_ch[pmi] as usize;
-                            let m_coeff = &m_coeff[pmi];
-                            let delta_cf = &delta_cf[pmi];
+                            let (mut acc, acc_delta) = dual_dot_product_i32_prefix(
+                                rematrix_buffer,
+                                &m_coeff[pmi],
+                                &delta_cf[pmi],
+                                max_matrix_chan + 1,
+                            );
 
                             let dither_index =
                                 (primitive_matrices - pmi) * (2 * blki_abs + 1) + blki_abs;
-
-                            for chi in 0..=max_matrix_chan {
-                                acc += rematrix_buffer[chi] as i64 * m_coeff[chi] as i64;
-                                acc_delta += rematrix_buffer[chi] as i64 * delta_cf[chi] as i64;
-                            }
 
                             if dither_scale != 0 {
                                 acc += (dither_table[dither_index & dither_index_mask] as i64)
@@ -595,10 +581,8 @@ impl DecoderState {
 
                     if *decoded_sample_len + block_size == samples_per_au {
                         for pmi in 0..primitive_matrices {
-                            let m_coeff = &mut m_coeff[pmi];
-                            let delta_cf = &delta_cf[pmi];
                             for chi in 0..=max_matrix_chan {
-                                m_coeff[chi] += delta_cf[chi];
+                                m_coeff[pmi][chi] += delta_cf[pmi][chi];
                             }
                         }
                     }
@@ -669,4 +653,10 @@ impl DecoderState {
 
         Ok(())
     }
+}
+
+#[inline]
+fn push_history_front(history: &mut [i32; 8], sample: i32) {
+    history.copy_within(..7, 1);
+    history[0] = sample;
 }

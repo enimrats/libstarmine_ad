@@ -18,6 +18,7 @@ pub(crate) mod matrix;
 pub(crate) mod oamd;
 pub(crate) mod parse;
 pub(crate) mod restart_header;
+pub(crate) mod simd;
 pub(crate) mod substream;
 pub(crate) mod sync;
 pub(crate) mod timing;

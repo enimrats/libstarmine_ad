@@ -193,19 +193,22 @@ impl ObjectPcmDecoder {
         }))
         .map_err(|panic| TrueHdError::parse(format!("panic: {}", panic_message(panic))))?
         .map_err(TrueHdError::parse)?;
-        let decoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.decoder
                 .decode_presentation(&parsed, PRESENTATION_INDEX_ATMOS)
         }))
         .map_err(|panic| TrueHdError::decode(format!("panic: {}", panic_message(panic))))?
         .map_err(TrueHdError::decode)?;
+        let cached_layout = self.layout.clone();
+        let decoded = self.decoder.decoded_access_unit();
 
         self.access_units_seen += 1;
 
-        let layout = self.resolve_layout(
-            &decoded.channel_labels,
+        let layout = Self::resolve_layout(
+            cached_layout.as_ref(),
+            decoded.channel_labels,
             decoded.channel_count,
-            &decoded.oamd,
+            decoded.oamd,
         )?;
         let bed_channels = layout.bed_channel_order.len();
         if layout.dynamic_object_count == 0 {
@@ -219,10 +222,11 @@ impl ObjectPcmDecoder {
             )));
         }
 
-        let planar = deinterleave_planar(
-            &decoded.pcm_data,
+        let (bed_pcm, object_pcm) = deinterleave_bed_object_channels(
+            decoded.pcm_data,
             decoded.sample_length,
-            decoded.channel_count,
+            bed_channels,
+            layout.dynamic_object_count,
         );
         let metadata_updates = decoded
             .oamd
@@ -233,8 +237,8 @@ impl ObjectPcmDecoder {
         let pcm = ObjectPcmFrame {
             sample_rate: decoded.sampling_frequency,
             bed_channel_order: layout.bed_channel_order.clone(),
-            bed_channels: planar[..bed_channels].to_vec(),
-            object_channels: planar[bed_channels..].to_vec(),
+            bed_channels: bed_pcm,
+            object_channels: object_pcm,
             metadata_updates,
         };
 
@@ -249,7 +253,7 @@ impl ObjectPcmDecoder {
     }
 
     fn resolve_layout(
-        &self,
+        cached_layout: Option<&LayoutState>,
         channel_labels: &[ChannelLabel],
         channel_count: usize,
         oamd_payloads: &[ObjectAudioMetadataPayload],
@@ -262,7 +266,7 @@ impl ObjectPcmDecoder {
             return Ok(layout);
         }
 
-        if let Some(layout) = self.layout.clone() {
+        if let Some(layout) = cached_layout.cloned() {
             if layout.bed_channel_order.len() + layout.dynamic_object_count == channel_count {
                 return Ok(layout);
             }
@@ -368,18 +372,26 @@ fn bed_channel_from_label(label: ChannelLabel) -> Option<BedChannel> {
     }
 }
 
-fn deinterleave_planar(
+fn deinterleave_bed_object_channels(
     pcm_data: &[[i32; 16]; 160],
     sample_length: usize,
-    channel_count: usize,
-) -> Vec<Vec<f32>> {
-    let mut channels = vec![vec![0.0; sample_length]; channel_count];
+    bed_channel_count: usize,
+    object_count: usize,
+) -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
+    let mut bed_channels = vec![vec![0.0; sample_length]; bed_channel_count];
+    let mut object_channels = vec![vec![0.0; sample_length]; object_count];
+
     for (sample_index, row) in pcm_data.iter().take(sample_length).enumerate() {
-        for channel_index in 0..channel_count {
-            channels[channel_index][sample_index] = row[channel_index] as f32 * PCM_I24_SCALE;
+        for channel_index in 0..bed_channel_count {
+            bed_channels[channel_index][sample_index] = row[channel_index] as f32 * PCM_I24_SCALE;
+        }
+        for object_index in 0..object_count {
+            object_channels[object_index][sample_index] =
+                row[bed_channel_count + object_index] as f32 * PCM_I24_SCALE;
         }
     }
-    channels
+
+    (bed_channels, object_channels)
 }
 
 fn render_metadata_update_from_oamd(

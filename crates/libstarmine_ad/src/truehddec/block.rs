@@ -420,8 +420,6 @@ impl Block {
 
             let bypassed_lsb_bits = reader.position()? - bypassed_lsb_start_pos;
             let block_data = &mut b.block_data[blki];
-
-            let mut channel_data = [0i32; 16];
             let mut position_checks_needed = false;
 
             // huff decode
@@ -489,11 +487,8 @@ impl Block {
                     }
                 }
 
-                channel_data[chi] = audio_data;
+                block_data[chi] = audio_data;
             }
-
-            block_data[min_chan..(max_chan + 1)]
-                .copy_from_slice(&channel_data[min_chan..(max_chan + 1)]);
         }
 
         if let Some(block_data_bits) = b.block_data_bits {
@@ -531,10 +526,6 @@ impl Block {
         if let Some(block_header) = &self.block_header {
             block_header.update_decoder_state(state)?;
         }
-
-        let ss_state = state.substream_state_mut()?;
-        ss_state.bypassed_lsb = self.bypassed_lsb;
-        ss_state.block_data = self.block_data;
 
         Ok(())
     }

@@ -591,7 +591,7 @@ impl StarmineAdTrueHdRenderer714Handle {
         match self.decoder.push_access_unit(access_unit) {
             Ok(Some(result)) => {
                 let info = StarmineAdTrueHdAccessUnitInfo::from_result(&result);
-                let input = result.pcm.to_render_input();
+                let input = result.pcm.into_render_input();
                 self.last_rendered = Some(
                     self.renderer
                         .push_frame(&input)

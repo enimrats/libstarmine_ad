@@ -73,13 +73,25 @@ static void progress_stats_init(struct progress_stats *stats) {
     stats->processed_audio_seconds = 0.0;
 }
 
-static void progress_stats_add_access_unit(
-    struct progress_stats *stats, const starmine_ad_access_unit_info *info) {
+static void progress_stats_add_eac3_access_unit(
+    struct progress_stats *stats,
+    const starmine_ad_eac3_access_unit_info *info) {
     if (!stats || !info || info->sample_rate == 0 || info->num_blocks == 0)
         return;
 
     stats->processed_audio_seconds +=
         (256.0 * (double)info->num_blocks) / (double)info->sample_rate;
+}
+
+static void progress_stats_add_truehd_access_unit(
+    struct progress_stats *stats,
+    const starmine_ad_truehd_access_unit_info *info) {
+    if (!stats || !info || !info->has_frame || info->sample_rate == 0 ||
+        info->samples_per_channel == 0)
+        return;
+
+    stats->processed_audio_seconds +=
+        (double)info->samples_per_channel / (double)info->sample_rate;
 }
 
 static void format_media_time(double seconds, char *buffer, size_t buffer_len) {
@@ -203,6 +215,19 @@ static bool write_f32_le(FILE *file, float value) {
     uint32_t bits = 0;
     memcpy(&bits, &value, sizeof(bits));
     return write_u32_le(file, bits);
+}
+
+static bool truehd_packet_is_single_access_unit(const uint8_t *data,
+                                                size_t len) {
+    uint16_t header = 0;
+    size_t access_unit_len = 0;
+
+    if (!data || len < 2)
+        return false;
+
+    header = (uint16_t)((uint16_t)data[0] << 8 | (uint16_t)data[1]);
+    access_unit_len = (size_t)((header & 0x0fffU) << 1);
+    return access_unit_len != 0 && access_unit_len == len;
 }
 
 static bool wav_writer_open(struct wav_writer *writer, const char *path) {
@@ -336,36 +361,38 @@ static void wav_writer_close(struct wav_writer *writer) {
     writer->file = NULL;
 }
 
-static bool process_access_unit(starmine_ad_renderer_714 *renderer,
-                                struct wav_writer *writer, const uint8_t *data,
-                                size_t len, int packet_index,
-                                int access_unit_index, int64_t pts,
-                                AVRational time_base, int *rendered_frames,
-                                bool *printed_layout,
-                                struct progress_stats *progress) {
-    starmine_ad_access_unit_info info;
+static bool process_eac3_access_unit(starmine_ad_eac3_renderer_714 *renderer,
+                                     struct wav_writer *writer,
+                                     const uint8_t *data, size_t len,
+                                     int packet_index, int access_unit_index,
+                                     int64_t pts, AVRational time_base,
+                                     int *rendered_frames, bool *printed_layout,
+                                     struct progress_stats *progress) {
+    starmine_ad_eac3_access_unit_info info;
     starmine_ad_render_714_frame frame;
     starmine_ad_status status;
     char time_buf[32];
     char speed_buf[32];
 
-    if (starmine_ad_access_unit_info_init(&info) != STARMINE_AD_STATUS_OK ||
+    if (starmine_ad_eac3_access_unit_info_init(&info) !=
+            STARMINE_AD_STATUS_OK ||
         starmine_ad_render_714_frame_init(&frame) != STARMINE_AD_STATUS_OK) {
         fprintf(stderr, "failed to initialize render structs\n");
         return false;
     }
 
-    status = starmine_ad_renderer_714_push_access_unit(renderer, data, len,
-                                                       &info, &frame);
+    status = starmine_ad_eac3_renderer_714_push_access_unit(renderer, data, len,
+                                                            &info, &frame);
     if (status != STARMINE_AD_STATUS_OK) {
-        fprintf(stderr,
-                "render failed: packet=%d au=%d pts=%.6f size=%zu status=%s\n",
-                packet_index, access_unit_index, ts_to_seconds(pts, time_base),
-                len, starmine_ad_status_string(status));
+        fprintf(
+            stderr,
+            "eac3 render failed: packet=%d au=%d pts=%.6f size=%zu status=%s\n",
+            packet_index, access_unit_index, ts_to_seconds(pts, time_base), len,
+            starmine_ad_status_string(status));
         return false;
     }
 
-    progress_stats_add_access_unit(progress, &info);
+    progress_stats_add_eac3_access_unit(progress, &info);
     format_media_time(progress->processed_audio_seconds, time_buf,
                       sizeof(time_buf));
     format_speed(progress, speed_buf, sizeof(speed_buf));
@@ -391,6 +418,63 @@ static bool process_access_unit(starmine_ad_renderer_714 *renderer,
     return true;
 }
 
+static bool process_truehd_access_unit(
+    starmine_ad_truehd_renderer_714 *renderer, struct wav_writer *writer,
+    const uint8_t *data, size_t len, int packet_index, int access_unit_index,
+    int64_t pts, AVRational time_base, int *rendered_frames,
+    bool *printed_layout, struct progress_stats *progress) {
+    starmine_ad_truehd_access_unit_info info;
+    starmine_ad_render_714_frame frame;
+    starmine_ad_status status;
+    char time_buf[32];
+    char speed_buf[32];
+
+    if (starmine_ad_truehd_access_unit_info_init(&info) !=
+            STARMINE_AD_STATUS_OK ||
+        starmine_ad_render_714_frame_init(&frame) != STARMINE_AD_STATUS_OK) {
+        fprintf(stderr, "failed to initialize render structs\n");
+        return false;
+    }
+
+    status = starmine_ad_truehd_renderer_714_push_access_unit(
+        renderer, data, len, &info, &frame);
+    if (status != STARMINE_AD_STATUS_OK) {
+        fprintf(stderr,
+                "truehd render failed: packet=%d au=%d pts=%.6f size=%zu "
+                "status=%s\n",
+                packet_index, access_unit_index, ts_to_seconds(pts, time_base),
+                len, starmine_ad_status_string(status));
+        return false;
+    }
+
+    progress_stats_add_truehd_access_unit(progress, &info);
+    format_media_time(progress->processed_audio_seconds, time_buf,
+                      sizeof(time_buf));
+    format_speed(progress, speed_buf, sizeof(speed_buf));
+
+    printf("packet=%d au=%d pts=%.6f time=%s speed=%s truehd has_frame=%u "
+           "substream_changed=%u sr=%u bed=%u objects=%u metadata=%u "
+           "rendered=%u samples=%zu\n",
+           packet_index, access_unit_index, ts_to_seconds(pts, time_base),
+           time_buf, speed_buf, info.has_frame, info.substream_info_changed,
+           info.sample_rate, info.bed_channel_count, info.object_count,
+           info.metadata_update_count, frame.has_frame,
+           frame.samples_per_channel);
+
+    if (frame.has_frame && !*printed_layout) {
+        print_channel_order(&frame);
+        *printed_layout = true;
+    }
+
+    if (frame.has_frame) {
+        if (!wav_writer_write_frame(writer, &frame))
+            return false;
+        (*rendered_frames)++;
+    }
+
+    return true;
+}
+
 int main(int argc, char **argv) {
     const char *input = NULL;
     const char *output = NULL;
@@ -399,9 +483,13 @@ int main(int argc, char **argv) {
     AVCodecParserContext *parser = NULL;
     AVCodecContext *codec_ctx = NULL;
     const AVCodec *codec = NULL;
-    starmine_ad_renderer_714 *renderer = NULL;
+    starmine_ad_eac3_renderer_714 *eac3_renderer = NULL;
+    starmine_ad_truehd_renderer_714 *truehd_renderer = NULL;
     struct wav_writer writer;
     struct progress_stats progress;
+    enum AVCodecID codec_id = AV_CODEC_ID_NONE;
+    const char *codec_name = NULL;
+    bool truehd_used_parser = false;
     int stream_index = -1;
     int limit = -1;
     int packet_index = 0;
@@ -468,22 +556,29 @@ int main(int argc, char **argv) {
         fprintf(stderr, "stream index %d is out of range\n", stream_index);
         goto done;
     }
-    if (fmt->streams[stream_index]->codecpar->codec_id != AV_CODEC_ID_EAC3) {
-        fprintf(stderr, "stream %d is not E-AC-3 (codec_id=%d)\n", stream_index,
-                fmt->streams[stream_index]->codecpar->codec_id);
+
+    codec_id = fmt->streams[stream_index]->codecpar->codec_id;
+    if (codec_id == AV_CODEC_ID_EAC3) {
+        codec_name = "eac3";
+    } else if (codec_id == AV_CODEC_ID_TRUEHD) {
+        codec_name = "truehd";
+    } else {
+        fprintf(stderr, "stream %d is not E-AC-3 or TrueHD (codec_id=%d)\n",
+                stream_index, codec_id);
         goto done;
     }
 
-    codec = avcodec_find_decoder(AV_CODEC_ID_EAC3);
+    codec = avcodec_find_decoder(codec_id);
     if (!codec) {
         fprintf(stderr,
-                "failed to find libavcodec E-AC-3 parser/decoder metadata\n");
+                "failed to find libavcodec parser/decoder metadata for %s\n",
+                codec_name);
         goto done;
     }
 
-    parser = av_parser_init(AV_CODEC_ID_EAC3);
+    parser = av_parser_init(codec_id);
     if (!parser) {
-        fprintf(stderr, "failed to create E-AC-3 parser\n");
+        fprintf(stderr, "failed to create %s parser\n", codec_name);
         goto done;
     }
 
@@ -498,10 +593,18 @@ int main(int argc, char **argv) {
         goto done;
     }
 
-    renderer = starmine_ad_renderer_714_new();
-    if (!renderer) {
-        fprintf(stderr, "failed to allocate starmine_ad renderer\n");
-        goto done;
+    if (codec_id == AV_CODEC_ID_EAC3) {
+        eac3_renderer = starmine_ad_eac3_renderer_714_new();
+        if (!eac3_renderer) {
+            fprintf(stderr, "failed to allocate starmine_ad eac3 renderer\n");
+            goto done;
+        }
+    } else {
+        truehd_renderer = starmine_ad_truehd_renderer_714_new();
+        if (!truehd_renderer) {
+            fprintf(stderr, "failed to allocate starmine_ad truehd renderer\n");
+            goto done;
+        }
     }
 
     pkt = av_packet_alloc();
@@ -510,8 +613,8 @@ int main(int argc, char **argv) {
         goto done;
     }
 
-    printf("input=%s output=%s stream=%d codec=eac3 limit=%d\n", input, output,
-           stream_index, limit);
+    printf("input=%s output=%s stream=%d codec=%s limit=%d\n", input, output,
+           stream_index, codec_name, limit);
 
     while (av_read_frame(fmt, pkt) >= 0) {
         AVStream *stream = NULL;
@@ -527,43 +630,75 @@ int main(int argc, char **argv) {
         packet_data = pkt->data;
         packet_size = pkt->size;
 
-        while (packet_size > 0) {
-            uint8_t *access_unit = NULL;
-            int access_unit_size = 0;
-            int consumed = av_parser_parse2(
-                parser, codec_ctx, &access_unit, &access_unit_size, packet_data,
-                packet_size, pkt->pts, pkt->dts, pkt->pos);
-            if (consumed < 0) {
-                fprintf(stderr, "libav parser failed on packet %d\n",
-                        packet_index);
+        if (codec_id == AV_CODEC_ID_TRUEHD &&
+            truehd_packet_is_single_access_unit(packet_data,
+                                                (size_t)packet_size)) {
+            if (!process_truehd_access_unit(
+                    truehd_renderer, &writer, packet_data, (size_t)packet_size,
+                    packet_index, access_unit_index, pkt->pts,
+                    stream->time_base, &rendered_frames, &printed_layout,
+                    &progress)) {
                 av_packet_unref(pkt);
                 goto done;
             }
-
-            packet_data += consumed;
-            packet_size -= consumed;
-
-            if (access_unit_size > 0) {
-                if (!process_access_unit(renderer, &writer, access_unit,
-                                         (size_t)access_unit_size, packet_index,
-                                         access_unit_index, pkt->pts,
-                                         stream->time_base, &rendered_frames,
-                                         &printed_layout, &progress)) {
+            access_unit_index++;
+            if (limit >= 0 && access_unit_index >= limit) {
+                av_packet_unref(pkt);
+                goto finalize;
+            }
+        } else {
+            while (packet_size > 0) {
+                uint8_t *access_unit = NULL;
+                int access_unit_size = 0;
+                int consumed = av_parser_parse2(
+                    parser, codec_ctx, &access_unit, &access_unit_size,
+                    packet_data, packet_size, pkt->pts, pkt->dts, pkt->pos);
+                if (consumed < 0) {
+                    fprintf(stderr, "libav parser failed on packet %d\n",
+                            packet_index);
                     av_packet_unref(pkt);
                     goto done;
                 }
-                access_unit_index++;
-                if (limit >= 0 && access_unit_index >= limit) {
-                    av_packet_unref(pkt);
-                    goto finalize;
-                }
-            }
 
-            if (consumed == 0 && access_unit_size == 0) {
-                fprintf(stderr, "libav parser made no progress on packet %d\n",
-                        packet_index);
-                av_packet_unref(pkt);
-                goto done;
+                packet_data += consumed;
+                packet_size -= consumed;
+
+                if (access_unit_size > 0) {
+                    bool ok = false;
+
+                    if (codec_id == AV_CODEC_ID_EAC3) {
+                        ok = process_eac3_access_unit(
+                            eac3_renderer, &writer, access_unit,
+                            (size_t)access_unit_size, packet_index,
+                            access_unit_index, pkt->pts, stream->time_base,
+                            &rendered_frames, &printed_layout, &progress);
+                    } else {
+                        truehd_used_parser = true;
+                        ok = process_truehd_access_unit(
+                            truehd_renderer, &writer, access_unit,
+                            (size_t)access_unit_size, packet_index,
+                            access_unit_index, pkt->pts, stream->time_base,
+                            &rendered_frames, &printed_layout, &progress);
+                    }
+
+                    if (!ok) {
+                        av_packet_unref(pkt);
+                        goto done;
+                    }
+                    access_unit_index++;
+                    if (limit >= 0 && access_unit_index >= limit) {
+                        av_packet_unref(pkt);
+                        goto finalize;
+                    }
+                }
+
+                if (consumed == 0 && access_unit_size == 0) {
+                    fprintf(stderr,
+                            "libav parser made no progress on packet %d\n",
+                            packet_index);
+                    av_packet_unref(pkt);
+                    goto done;
+                }
             }
         }
 
@@ -571,33 +706,80 @@ int main(int argc, char **argv) {
         av_packet_unref(pkt);
     }
 
-    while (1) {
-        uint8_t *access_unit = NULL;
-        int access_unit_size = 0;
-        int consumed =
-            av_parser_parse2(parser, codec_ctx, &access_unit, &access_unit_size,
-                             NULL, 0, AV_NOPTS_VALUE, AV_NOPTS_VALUE, -1);
-        if (consumed < 0) {
-            fprintf(stderr, "libav parser flush failed\n");
-            goto done;
-        }
-        if (access_unit_size <= 0)
-            break;
+    if (codec_id == AV_CODEC_ID_EAC3 ||
+        (codec_id == AV_CODEC_ID_TRUEHD && truehd_used_parser)) {
+        while (1) {
+            uint8_t *access_unit = NULL;
+            int access_unit_size = 0;
+            int consumed = av_parser_parse2(parser, codec_ctx, &access_unit,
+                                            &access_unit_size, NULL, 0,
+                                            AV_NOPTS_VALUE, AV_NOPTS_VALUE, -1);
+            if (consumed < 0) {
+                fprintf(stderr, "libav parser flush failed\n");
+                goto done;
+            }
+            if (access_unit_size <= 0)
+                break;
 
-        if (!process_access_unit(renderer, &writer, access_unit,
-                                 (size_t)access_unit_size, packet_index,
-                                 access_unit_index, AV_NOPTS_VALUE,
-                                 fmt->streams[stream_index]->time_base,
-                                 &rendered_frames, &printed_layout,
-                                 &progress)) {
-            goto done;
+            if (codec_id == AV_CODEC_ID_EAC3) {
+                if (!process_eac3_access_unit(
+                        eac3_renderer, &writer, access_unit,
+                        (size_t)access_unit_size, packet_index,
+                        access_unit_index, AV_NOPTS_VALUE,
+                        fmt->streams[stream_index]->time_base, &rendered_frames,
+                        &printed_layout, &progress)) {
+                    goto done;
+                }
+            } else {
+                if (!process_truehd_access_unit(
+                        truehd_renderer, &writer, access_unit,
+                        (size_t)access_unit_size, packet_index,
+                        access_unit_index, AV_NOPTS_VALUE,
+                        fmt->streams[stream_index]->time_base, &rendered_frames,
+                        &printed_layout, &progress)) {
+                    goto done;
+                }
+            }
+            access_unit_index++;
+            if (limit >= 0 && access_unit_index >= limit)
+                break;
         }
-        access_unit_index++;
-        if (limit >= 0 && access_unit_index >= limit)
-            break;
     }
 
-finalize:
+finalize: {
+    starmine_ad_render_714_frame frame;
+    starmine_ad_status status;
+
+    if (starmine_ad_render_714_frame_init(&frame) != STARMINE_AD_STATUS_OK) {
+        fprintf(stderr, "failed to initialize flush frame\n");
+        goto done;
+    }
+
+    if (codec_id == AV_CODEC_ID_EAC3 && eac3_renderer) {
+        status = starmine_ad_eac3_renderer_714_flush(eac3_renderer, &frame);
+    } else if (codec_id == AV_CODEC_ID_TRUEHD && truehd_renderer) {
+        status = starmine_ad_truehd_renderer_714_flush(truehd_renderer, &frame);
+    } else {
+        status = STARMINE_AD_STATUS_OK;
+    }
+
+    if (status != STARMINE_AD_STATUS_OK) {
+        fprintf(stderr, "renderer flush failed: status=%s\n",
+                starmine_ad_status_string(status));
+        goto done;
+    }
+
+    if (frame.has_frame) {
+        if (!printed_layout) {
+            print_channel_order(&frame);
+            printed_layout = true;
+        }
+        if (!wav_writer_write_frame(&writer, &frame))
+            goto done;
+        rendered_frames++;
+    }
+}
+
     if (!wav_writer_finalize(&writer))
         goto done;
 
@@ -607,8 +789,9 @@ finalize:
         format_media_time(progress.processed_audio_seconds, time_buf,
                           sizeof(time_buf));
         format_speed(&progress, speed_buf, sizeof(speed_buf));
-        printf("access_units=%d rendered_frames=%d time=%s speed=%s output=%s\n",
-               access_unit_index, rendered_frames, time_buf, speed_buf, output);
+        printf(
+            "access_units=%d rendered_frames=%d time=%s speed=%s output=%s\n",
+            access_unit_index, rendered_frames, time_buf, speed_buf, output);
     }
     if (rendered_frames == 0) {
         printf("no 7.1.4 frames were produced\n");
@@ -618,8 +801,10 @@ finalize:
 done:
     if (pkt)
         av_packet_free(&pkt);
-    if (renderer)
-        starmine_ad_renderer_714_free(renderer);
+    if (eac3_renderer)
+        starmine_ad_eac3_renderer_714_free(eac3_renderer);
+    if (truehd_renderer)
+        starmine_ad_truehd_renderer_714_free(truehd_renderer);
     if (codec_ctx)
         avcodec_free_context(&codec_ctx);
     if (parser)

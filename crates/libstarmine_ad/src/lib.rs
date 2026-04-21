@@ -41,11 +41,13 @@
 //! # C Integration
 //!
 //! A C ABI is provided through [starmine_ad.h](../../include/starmine_ad.h). The header exposes
-//! both the low-level [`eac3dec::Decoder`] entry point and a stateful 7.1.4 rendering path:
-//! create either a decoder handle or a renderer handle, push one complete access unit at a time,
-//! read a copied [`eac3dec::AccessUnitInfo`]-style summary, and reset the handle when the stream
-//! position jumps. The render path exports borrowed planar `float` pointers whose lifetime is tied
-//! to the renderer handle. A libav-based end-to-end C example lives under `Starmine_ad/examples/`.
+//! explicit codec-specific entry points:
+//!
+//! - `starmine_ad_eac3_*` for E-AC-3/JOC inspection and 7.1.4 rendering.
+//! - `starmine_ad_truehd_*` for TrueHD/Atmos access-unit decoding and 7.1.4 rendering.
+//!
+//! The render paths export borrowed planar `float` pointers whose lifetime is tied to the owning
+//! handle. A libav-based end-to-end C example lives under `Starmine_ad/examples/`.
 
 pub mod eac3dec;
 mod ffi;

@@ -85,18 +85,21 @@ impl TrueHdError {
             message: message.into(),
         }
     }
-}
 
-impl fmt::Display for TrueHdError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let kind = match self.kind {
+    pub(crate) fn kind_name(&self) -> &'static str {
+        match self.kind {
             TrueHdErrorKind::Extract => "extract",
             TrueHdErrorKind::Parse => "parse",
             TrueHdErrorKind::Decode => "decode",
             TrueHdErrorKind::UnsupportedLayout => "unsupported-layout",
             TrueHdErrorKind::InvalidMetadata => "invalid-metadata",
-        };
-        write!(f, "truehd-{kind} {}", self.message)
+        }
+    }
+}
+
+impl fmt::Display for TrueHdError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "truehd-{} {}", self.kind_name(), self.message)
     }
 }
 

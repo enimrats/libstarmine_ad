@@ -3,18 +3,22 @@ use std::ptr;
 use std::slice;
 
 use crate::eac3dec::{
-    AccessUnitInfo, CoreDecodeState, CorePcmFrame, Decoder, FrameType, JocObjectDecoderState,
-    MetadataParseState, ParseError, ParsedEmdfPayloadData, PushResult,
+    AccessUnitInfo, CoreDecodeState, CorePcmFrame, Decoder as Eac3Decoder, FrameType,
+    JocObjectDecoderState, MetadataParseState, ParseError, ParsedEmdfPayloadData, PushResult,
     decode_core_pcm_frame_with_state_into, inspect_access_unit_with_metadata_state,
     render_input_from_eac3_parts,
 };
 use crate::renderer::{BedChannel, Render714Error, Render714Frame, Renderer714};
+use crate::truehddec::{
+    ObjectPcmDecoder as TrueHdDecoder, ObjectPcmFrame as TrueHdObjectPcmFrame,
+    ObjectPcmPushResult as TrueHdObjectPcmPushResult, TrueHdError,
+};
 
 const STARMINE_AD_RENDER_714_CHANNELS: usize = 12;
 
 #[repr(C)]
-/// C ABI snapshot for one parsed access unit.
-pub struct StarmineAdAccessUnitInfo {
+/// C ABI snapshot for one parsed E-AC-3 access unit.
+pub struct StarmineAdEac3AccessUnitInfo {
     pub frame_size: u32,
     pub bitstream_id: u8,
     pub frame_type: u8,
@@ -33,6 +37,20 @@ pub struct StarmineAdAccessUnitInfo {
     pub oamd_payload_count: u32,
     pub has_first_emdf_sync_offset: u8,
     pub first_emdf_sync_offset: u32,
+    pub frames_seen: u64,
+}
+
+#[repr(C)]
+/// C ABI snapshot for one decoded TrueHD access unit.
+pub struct StarmineAdTrueHdAccessUnitInfo {
+    pub has_frame: u8,
+    pub substream_info_changed: u8,
+    pub sample_rate: u32,
+    pub samples_per_channel: u32,
+    pub bed_channel_count: u32,
+    pub object_count: u32,
+    pub metadata_update_count: u32,
+    pub access_units_seen: u64,
     pub frames_seen: u64,
 }
 
@@ -80,6 +98,51 @@ impl From<BedChannel> for StarmineAdBedChannel {
             BedChannel::WideLeft => Self::WideLeft,
             BedChannel::WideRight => Self::WideRight,
             BedChannel::LowFrequencyEffects2 => Self::LowFrequencyEffects2,
+        }
+    }
+}
+
+#[repr(C)]
+/// Borrowed view of one decoded object-PCM frame.
+pub struct StarmineAdObjectPcmFrame {
+    pub has_frame: u8,
+    pub sample_rate: u32,
+    pub samples_per_channel: usize,
+    pub bed_channel_count: usize,
+    pub object_count: usize,
+    pub bed_channel_order: *const StarmineAdBedChannel,
+    pub bed_channels: *const *const f32,
+    pub object_channels: *const *const f32,
+}
+
+impl StarmineAdObjectPcmFrame {
+    fn empty() -> Self {
+        Self {
+            has_frame: 0,
+            sample_rate: 0,
+            samples_per_channel: 0,
+            bed_channel_count: 0,
+            object_count: 0,
+            bed_channel_order: ptr::null(),
+            bed_channels: ptr::null(),
+            object_channels: ptr::null(),
+        }
+    }
+
+    fn from_handle(handle: &StarmineAdTrueHdDecoderHandle) -> Self {
+        let Some(frame) = handle.last_pcm.as_ref() else {
+            return Self::empty();
+        };
+
+        Self {
+            has_frame: 1,
+            sample_rate: frame.sample_rate,
+            samples_per_channel: frame.samples_per_channel(),
+            bed_channel_count: handle.last_bed_channel_order.len(),
+            object_count: handle.last_object_channel_ptrs.len(),
+            bed_channel_order: slice_ptr(&handle.last_bed_channel_order),
+            bed_channels: slice_ptr(&handle.last_bed_channel_ptrs),
+            object_channels: slice_ptr(&handle.last_object_channel_ptrs),
         }
     }
 }
@@ -149,6 +212,10 @@ pub enum StarmineAdStatus {
     UnsupportedBedChannel = -13,
     SampleRateChanged = -14,
     BedChannelCountMismatch = -15,
+    TrueHdParse = -16,
+    TrueHdDecode = -17,
+    TrueHdUnsupportedLayout = -18,
+    TrueHdInvalidMetadata = -19,
 }
 
 impl StarmineAdStatus {
@@ -173,6 +240,16 @@ impl StarmineAdStatus {
             Render714Error::UnsupportedSampleCount(_) => Self::UnsupportedSampleCount,
             Render714Error::UnsupportedBedChannel(_) => Self::UnsupportedBedChannel,
             Render714Error::SampleRateChanged { .. } => Self::SampleRateChanged,
+        }
+    }
+
+    fn from_truehd_error(error: &TrueHdError) -> Self {
+        match error.kind_name() {
+            "extract" | "parse" => Self::TrueHdParse,
+            "decode" => Self::TrueHdDecode,
+            "unsupported-layout" => Self::TrueHdUnsupportedLayout,
+            "invalid-metadata" => Self::TrueHdInvalidMetadata,
+            _ => Self::TrueHdParse,
         }
     }
 }
@@ -202,7 +279,7 @@ mod tests {
     }
 }
 
-impl StarmineAdAccessUnitInfo {
+impl StarmineAdEac3AccessUnitInfo {
     fn from_parts(info: &AccessUnitInfo, frames_seen: u64) -> Self {
         let AccessUnitInfo {
             frame_size,
@@ -254,9 +331,47 @@ impl StarmineAdAccessUnitInfo {
     }
 }
 
-impl From<&PushResult> for StarmineAdAccessUnitInfo {
+impl From<&PushResult> for StarmineAdEac3AccessUnitInfo {
     fn from(result: &PushResult) -> Self {
         Self::from_parts(&result.info, result.frames_seen)
+    }
+}
+
+impl StarmineAdTrueHdAccessUnitInfo {
+    fn empty() -> Self {
+        Self {
+            has_frame: 0,
+            substream_info_changed: 0,
+            sample_rate: 0,
+            samples_per_channel: 0,
+            bed_channel_count: 0,
+            object_count: 0,
+            metadata_update_count: 0,
+            access_units_seen: 0,
+            frames_seen: 0,
+        }
+    }
+
+    fn from_result(result: &TrueHdObjectPcmPushResult) -> Self {
+        Self {
+            has_frame: 1,
+            substream_info_changed: if result.substream_info_changed { 1 } else { 0 },
+            sample_rate: result.pcm.sample_rate,
+            samples_per_channel: result.pcm.samples_per_channel() as u32,
+            bed_channel_count: result.pcm.bed_channel_count() as u32,
+            object_count: result.pcm.object_count() as u32,
+            metadata_update_count: result.pcm.metadata_updates.len() as u32,
+            access_units_seen: result.access_units_seen,
+            frames_seen: result.frames_seen,
+        }
+    }
+
+    fn from_decoder_no_frame(decoder: &TrueHdDecoder) -> Self {
+        Self {
+            access_units_seen: decoder.access_units_seen(),
+            frames_seen: decoder.frames_seen(),
+            ..Self::empty()
+        }
     }
 }
 
@@ -276,9 +391,13 @@ static STATUS_UNSUPPORTED_SAMPLE_COUNT: &[u8] = b"unsupported-sample-count\0";
 static STATUS_UNSUPPORTED_BED_CHANNEL: &[u8] = b"unsupported-bed-channel\0";
 static STATUS_SAMPLE_RATE_CHANGED: &[u8] = b"sample-rate-changed\0";
 static STATUS_BED_CHANNEL_COUNT_MISMATCH: &[u8] = b"bed-channel-count-mismatch\0";
+static STATUS_TRUEHD_PARSE: &[u8] = b"truehd-parse\0";
+static STATUS_TRUEHD_DECODE: &[u8] = b"truehd-decode\0";
+static STATUS_TRUEHD_UNSUPPORTED_LAYOUT: &[u8] = b"truehd-unsupported-layout\0";
+static STATUS_TRUEHD_INVALID_METADATA: &[u8] = b"truehd-invalid-metadata\0";
 
 #[derive(Debug)]
-pub struct StarmineAdRenderer714Handle {
+pub struct StarmineAdEac3Renderer714Handle {
     frames_seen: u64,
     core_state: CoreDecodeState,
     core_pcm: CorePcmFrame,
@@ -289,7 +408,7 @@ pub struct StarmineAdRenderer714Handle {
     last_rendered: Option<Render714Frame>,
 }
 
-impl Default for StarmineAdRenderer714Handle {
+impl Default for StarmineAdEac3Renderer714Handle {
     fn default() -> Self {
         Self {
             frames_seen: 0,
@@ -309,7 +428,7 @@ impl Default for StarmineAdRenderer714Handle {
     }
 }
 
-impl StarmineAdRenderer714Handle {
+impl StarmineAdEac3Renderer714Handle {
     fn reset(&mut self) {
         self.frames_seen = 0;
         self.core_state.reset();
@@ -373,17 +492,159 @@ impl StarmineAdRenderer714Handle {
         self.frames_seen += 1;
         Ok(info)
     }
+
+    fn flush(&mut self) {
+        self.clear_last_rendered();
+        self.last_rendered = self.renderer.flush();
+    }
+}
+
+#[derive(Default)]
+pub struct StarmineAdTrueHdDecoderHandle {
+    decoder: TrueHdDecoder,
+    last_pcm: Option<TrueHdObjectPcmFrame>,
+    last_bed_channel_order: Vec<StarmineAdBedChannel>,
+    last_bed_channel_ptrs: Vec<*const f32>,
+    last_object_channel_ptrs: Vec<*const f32>,
+}
+
+impl StarmineAdTrueHdDecoderHandle {
+    fn reset(&mut self) {
+        self.decoder.reset();
+        self.clear_last_pcm();
+    }
+
+    fn clear_last_pcm(&mut self) {
+        self.last_pcm = None;
+        self.last_bed_channel_order.clear();
+        self.last_bed_channel_ptrs.clear();
+        self.last_object_channel_ptrs.clear();
+    }
+
+    fn set_last_pcm(&mut self, pcm: TrueHdObjectPcmFrame) {
+        self.last_pcm = Some(pcm);
+        self.last_bed_channel_order.clear();
+        self.last_bed_channel_ptrs.clear();
+        self.last_object_channel_ptrs.clear();
+
+        if let Some(frame) = self.last_pcm.as_ref() {
+            self.last_bed_channel_order.extend(
+                frame
+                    .bed_channel_order
+                    .iter()
+                    .copied()
+                    .map(StarmineAdBedChannel::from),
+            );
+            self.last_bed_channel_ptrs
+                .extend(frame.bed_channels.iter().map(|channel| channel.as_ptr()));
+            self.last_object_channel_ptrs
+                .extend(frame.object_channels.iter().map(|channel| channel.as_ptr()));
+        }
+    }
+
+    fn push_access_unit(
+        &mut self,
+        access_unit: &[u8],
+    ) -> Result<StarmineAdTrueHdAccessUnitInfo, StarmineAdStatus> {
+        self.clear_last_pcm();
+        validate_truehd_access_unit(access_unit)?;
+
+        match self.decoder.push_access_unit(access_unit) {
+            Ok(Some(result)) => {
+                let info = StarmineAdTrueHdAccessUnitInfo::from_result(&result);
+                self.set_last_pcm(result.pcm);
+                Ok(info)
+            }
+            Ok(None) => Ok(StarmineAdTrueHdAccessUnitInfo::from_decoder_no_frame(
+                &self.decoder,
+            )),
+            Err(error) => Err(StarmineAdStatus::from_truehd_error(&error)),
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct StarmineAdTrueHdRenderer714Handle {
+    decoder: TrueHdDecoder,
+    renderer: Renderer714,
+    last_rendered: Option<Render714Frame>,
+}
+
+impl StarmineAdTrueHdRenderer714Handle {
+    fn reset(&mut self) {
+        self.decoder.reset();
+        self.renderer.reset();
+        self.clear_last_rendered();
+    }
+
+    fn clear_last_rendered(&mut self) {
+        self.last_rendered = None;
+    }
+
+    fn push_access_unit(
+        &mut self,
+        access_unit: &[u8],
+    ) -> Result<StarmineAdTrueHdAccessUnitInfo, StarmineAdStatus> {
+        self.clear_last_rendered();
+        validate_truehd_access_unit(access_unit)?;
+
+        match self.decoder.push_access_unit(access_unit) {
+            Ok(Some(result)) => {
+                let info = StarmineAdTrueHdAccessUnitInfo::from_result(&result);
+                let input = result.pcm.to_render_input();
+                self.last_rendered = Some(
+                    self.renderer
+                        .push_frame(&input)
+                        .map_err(StarmineAdStatus::from_render_error)?,
+                );
+                Ok(info)
+            }
+            Ok(None) => Ok(StarmineAdTrueHdAccessUnitInfo::from_decoder_no_frame(
+                &self.decoder,
+            )),
+            Err(error) => Err(StarmineAdStatus::from_truehd_error(&error)),
+        }
+    }
+
+    fn flush(&mut self) {
+        self.clear_last_rendered();
+        self.last_rendered = self.renderer.flush();
+    }
+}
+
+fn slice_ptr<T>(slice: &[T]) -> *const T {
+    if slice.is_empty() {
+        ptr::null()
+    } else {
+        slice.as_ptr()
+    }
+}
+
+fn validate_truehd_access_unit(access_unit: &[u8]) -> Result<(), StarmineAdStatus> {
+    if access_unit.len() < 2 {
+        return Err(StarmineAdStatus::ShortPacket);
+    }
+
+    let expected = ((u16::from_be_bytes([access_unit[0], access_unit[1]]) & 0x0FFF) << 1) as usize;
+    if access_unit.len() < expected {
+        return Err(StarmineAdStatus::TruncatedFrame);
+    }
+    if access_unit.len() != expected {
+        return Err(StarmineAdStatus::TrailingData);
+    }
+
+    Ok(())
 }
 
 #[unsafe(no_mangle)]
-/// Create a new C ABI decoder handle.
-pub extern "C" fn starmine_ad_decoder_new() -> *mut Decoder {
-    Box::into_raw(Box::new(Decoder::new()))
+/// Create a new E-AC-3 decoder handle.
+pub extern "C" fn starmine_ad_eac3_decoder_new() -> *mut Eac3Decoder {
+    Box::into_raw(Box::new(Eac3Decoder::new()))
 }
 
 #[unsafe(no_mangle)]
-/// Destroy a decoder handle previously returned by [`starmine_ad_decoder_new`].
-pub unsafe extern "C" fn starmine_ad_decoder_free(decoder: *mut Decoder) {
+/// Destroy a decoder handle previously returned by [`starmine_ad_eac3_decoder_new`].
+pub unsafe extern "C" fn starmine_ad_eac3_decoder_free(decoder: *mut Eac3Decoder) {
     if !decoder.is_null() {
         unsafe {
             drop(Box::from_raw(decoder));
@@ -392,8 +653,10 @@ pub unsafe extern "C" fn starmine_ad_decoder_free(decoder: *mut Decoder) {
 }
 
 #[unsafe(no_mangle)]
-/// Reset a decoder handle after a seek or discontinuity.
-pub unsafe extern "C" fn starmine_ad_decoder_reset(decoder: *mut Decoder) -> StarmineAdStatus {
+/// Reset an E-AC-3 decoder handle after a seek or discontinuity.
+pub unsafe extern "C" fn starmine_ad_eac3_decoder_reset(
+    decoder: *mut Eac3Decoder,
+) -> StarmineAdStatus {
     let Some(decoder) = (unsafe { decoder.as_mut() }) else {
         return StarmineAdStatus::NullPointer;
     };
@@ -402,12 +665,12 @@ pub unsafe extern "C" fn starmine_ad_decoder_reset(decoder: *mut Decoder) -> Sta
 }
 
 #[unsafe(no_mangle)]
-/// Parse one complete access unit through the C ABI.
-pub unsafe extern "C" fn starmine_ad_decoder_push_access_unit(
-    decoder: *mut Decoder,
+/// Parse one complete E-AC-3 access unit through the C ABI.
+pub unsafe extern "C" fn starmine_ad_eac3_decoder_push_access_unit(
+    decoder: *mut Eac3Decoder,
     data: *const u8,
     len: usize,
-    out_info: *mut StarmineAdAccessUnitInfo,
+    out_info: *mut StarmineAdEac3AccessUnitInfo,
 ) -> StarmineAdStatus {
     let Some(decoder) = (unsafe { decoder.as_mut() }) else {
         return StarmineAdStatus::NullPointer;
@@ -420,7 +683,7 @@ pub unsafe extern "C" fn starmine_ad_decoder_push_access_unit(
     match decoder.push_access_unit(access_unit) {
         Ok(result) => {
             if let Some(out_info) = unsafe { out_info.as_mut() } {
-                *out_info = StarmineAdAccessUnitInfo::from(&result);
+                *out_info = StarmineAdEac3AccessUnitInfo::from(&result);
             }
             StarmineAdStatus::Ok
         }
@@ -429,14 +692,16 @@ pub unsafe extern "C" fn starmine_ad_decoder_push_access_unit(
 }
 
 #[unsafe(no_mangle)]
-/// Create a stateful 7.1.4 renderer handle.
-pub extern "C" fn starmine_ad_renderer_714_new() -> *mut StarmineAdRenderer714Handle {
-    Box::into_raw(Box::new(StarmineAdRenderer714Handle::default()))
+/// Create a stateful E-AC-3 7.1.4 renderer handle.
+pub extern "C" fn starmine_ad_eac3_renderer_714_new() -> *mut StarmineAdEac3Renderer714Handle {
+    Box::into_raw(Box::new(StarmineAdEac3Renderer714Handle::default()))
 }
 
 #[unsafe(no_mangle)]
-/// Destroy a renderer handle created by [`starmine_ad_renderer_714_new`].
-pub unsafe extern "C" fn starmine_ad_renderer_714_free(renderer: *mut StarmineAdRenderer714Handle) {
+/// Destroy a renderer handle created by [`starmine_ad_eac3_renderer_714_new`].
+pub unsafe extern "C" fn starmine_ad_eac3_renderer_714_free(
+    renderer: *mut StarmineAdEac3Renderer714Handle,
+) {
     if !renderer.is_null() {
         unsafe {
             drop(Box::from_raw(renderer));
@@ -445,9 +710,9 @@ pub unsafe extern "C" fn starmine_ad_renderer_714_free(renderer: *mut StarmineAd
 }
 
 #[unsafe(no_mangle)]
-/// Reset a renderer handle after a seek or discontinuity.
-pub unsafe extern "C" fn starmine_ad_renderer_714_reset(
-    renderer: *mut StarmineAdRenderer714Handle,
+/// Reset an E-AC-3 renderer handle after a seek or discontinuity.
+pub unsafe extern "C" fn starmine_ad_eac3_renderer_714_reset(
+    renderer: *mut StarmineAdEac3Renderer714Handle,
 ) -> StarmineAdStatus {
     let Some(renderer) = (unsafe { renderer.as_mut() }) else {
         return StarmineAdStatus::NullPointer;
@@ -457,12 +722,12 @@ pub unsafe extern "C" fn starmine_ad_renderer_714_reset(
 }
 
 #[unsafe(no_mangle)]
-/// Decode one access unit and, when possible, render it to 7.1.4 float PCM.
-pub unsafe extern "C" fn starmine_ad_renderer_714_push_access_unit(
-    renderer: *mut StarmineAdRenderer714Handle,
+/// Decode one E-AC-3 access unit and, when possible, render it to 7.1.4 float PCM.
+pub unsafe extern "C" fn starmine_ad_eac3_renderer_714_push_access_unit(
+    renderer: *mut StarmineAdEac3Renderer714Handle,
     data: *const u8,
     len: usize,
-    out_info: *mut StarmineAdAccessUnitInfo,
+    out_info: *mut StarmineAdEac3AccessUnitInfo,
     out_frame: *mut StarmineAdRender714Frame,
 ) -> StarmineAdStatus {
     let Some(renderer) = (unsafe { renderer.as_mut() }) else {
@@ -480,7 +745,7 @@ pub unsafe extern "C" fn starmine_ad_renderer_714_push_access_unit(
     match renderer.push_access_unit(access_unit) {
         Ok(info) => {
             if let Some(out_info) = unsafe { out_info.as_mut() } {
-                *out_info = StarmineAdAccessUnitInfo::from_parts(&info, renderer.frames_seen);
+                *out_info = StarmineAdEac3AccessUnitInfo::from_parts(&info, renderer.frames_seen);
             }
             if let Some(out_frame) = unsafe { out_frame.as_mut() }
                 && let Some(frame) = renderer.last_rendered.as_ref()
@@ -491,6 +756,182 @@ pub unsafe extern "C" fn starmine_ad_renderer_714_push_access_unit(
         }
         Err(status) => status,
     }
+}
+
+#[unsafe(no_mangle)]
+/// Emit the final short limiter block after the last E-AC-3 input frame.
+pub unsafe extern "C" fn starmine_ad_eac3_renderer_714_flush(
+    renderer: *mut StarmineAdEac3Renderer714Handle,
+    out_frame: *mut StarmineAdRender714Frame,
+) -> StarmineAdStatus {
+    let Some(renderer) = (unsafe { renderer.as_mut() }) else {
+        return StarmineAdStatus::NullPointer;
+    };
+    let Some(out_frame) = (unsafe { out_frame.as_mut() }) else {
+        return StarmineAdStatus::NullPointer;
+    };
+
+    *out_frame = StarmineAdRender714Frame::empty();
+    renderer.flush();
+    if let Some(frame) = renderer.last_rendered.as_ref() {
+        *out_frame = StarmineAdRender714Frame::from(frame);
+    }
+    StarmineAdStatus::Ok
+}
+
+#[unsafe(no_mangle)]
+/// Create a new TrueHD object decoder handle.
+pub extern "C" fn starmine_ad_truehd_decoder_new() -> *mut StarmineAdTrueHdDecoderHandle {
+    Box::into_raw(Box::new(StarmineAdTrueHdDecoderHandle::default()))
+}
+
+#[unsafe(no_mangle)]
+/// Destroy a decoder handle created by [`starmine_ad_truehd_decoder_new`].
+pub unsafe extern "C" fn starmine_ad_truehd_decoder_free(
+    decoder: *mut StarmineAdTrueHdDecoderHandle,
+) {
+    if !decoder.is_null() {
+        unsafe {
+            drop(Box::from_raw(decoder));
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+/// Reset a TrueHD decoder handle after a seek or discontinuity.
+pub unsafe extern "C" fn starmine_ad_truehd_decoder_reset(
+    decoder: *mut StarmineAdTrueHdDecoderHandle,
+) -> StarmineAdStatus {
+    let Some(decoder) = (unsafe { decoder.as_mut() }) else {
+        return StarmineAdStatus::NullPointer;
+    };
+    decoder.reset();
+    StarmineAdStatus::Ok
+}
+
+#[unsafe(no_mangle)]
+/// Decode one complete TrueHD access unit into bed / object PCM.
+pub unsafe extern "C" fn starmine_ad_truehd_decoder_push_access_unit(
+    decoder: *mut StarmineAdTrueHdDecoderHandle,
+    data: *const u8,
+    len: usize,
+    out_info: *mut StarmineAdTrueHdAccessUnitInfo,
+    out_frame: *mut StarmineAdObjectPcmFrame,
+) -> StarmineAdStatus {
+    let Some(decoder) = (unsafe { decoder.as_mut() }) else {
+        return StarmineAdStatus::NullPointer;
+    };
+    if data.is_null() {
+        return StarmineAdStatus::NullPointer;
+    }
+
+    if let Some(out_frame) = unsafe { out_frame.as_mut() } {
+        *out_frame = StarmineAdObjectPcmFrame::empty();
+    }
+
+    let access_unit = unsafe { slice::from_raw_parts(data, len) };
+    match decoder.push_access_unit(access_unit) {
+        Ok(info) => {
+            if let Some(out_info) = unsafe { out_info.as_mut() } {
+                *out_info = info;
+            }
+            if let Some(out_frame) = unsafe { out_frame.as_mut() }
+                && decoder.last_pcm.is_some()
+            {
+                *out_frame = StarmineAdObjectPcmFrame::from_handle(decoder);
+            }
+            StarmineAdStatus::Ok
+        }
+        Err(status) => status,
+    }
+}
+
+#[unsafe(no_mangle)]
+/// Create a stateful TrueHD 7.1.4 renderer handle.
+pub extern "C" fn starmine_ad_truehd_renderer_714_new() -> *mut StarmineAdTrueHdRenderer714Handle {
+    Box::into_raw(Box::new(StarmineAdTrueHdRenderer714Handle::default()))
+}
+
+#[unsafe(no_mangle)]
+/// Destroy a renderer handle created by [`starmine_ad_truehd_renderer_714_new`].
+pub unsafe extern "C" fn starmine_ad_truehd_renderer_714_free(
+    renderer: *mut StarmineAdTrueHdRenderer714Handle,
+) {
+    if !renderer.is_null() {
+        unsafe {
+            drop(Box::from_raw(renderer));
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+/// Reset a TrueHD renderer handle after a seek or discontinuity.
+pub unsafe extern "C" fn starmine_ad_truehd_renderer_714_reset(
+    renderer: *mut StarmineAdTrueHdRenderer714Handle,
+) -> StarmineAdStatus {
+    let Some(renderer) = (unsafe { renderer.as_mut() }) else {
+        return StarmineAdStatus::NullPointer;
+    };
+    renderer.reset();
+    StarmineAdStatus::Ok
+}
+
+#[unsafe(no_mangle)]
+/// Decode one TrueHD access unit and, when possible, render it to 7.1.4 float PCM.
+pub unsafe extern "C" fn starmine_ad_truehd_renderer_714_push_access_unit(
+    renderer: *mut StarmineAdTrueHdRenderer714Handle,
+    data: *const u8,
+    len: usize,
+    out_info: *mut StarmineAdTrueHdAccessUnitInfo,
+    out_frame: *mut StarmineAdRender714Frame,
+) -> StarmineAdStatus {
+    let Some(renderer) = (unsafe { renderer.as_mut() }) else {
+        return StarmineAdStatus::NullPointer;
+    };
+    if data.is_null() {
+        return StarmineAdStatus::NullPointer;
+    }
+
+    if let Some(out_frame) = unsafe { out_frame.as_mut() } {
+        *out_frame = StarmineAdRender714Frame::empty();
+    }
+
+    let access_unit = unsafe { slice::from_raw_parts(data, len) };
+    match renderer.push_access_unit(access_unit) {
+        Ok(info) => {
+            if let Some(out_info) = unsafe { out_info.as_mut() } {
+                *out_info = info;
+            }
+            if let Some(out_frame) = unsafe { out_frame.as_mut() }
+                && let Some(frame) = renderer.last_rendered.as_ref()
+            {
+                *out_frame = StarmineAdRender714Frame::from(frame);
+            }
+            StarmineAdStatus::Ok
+        }
+        Err(status) => status,
+    }
+}
+
+#[unsafe(no_mangle)]
+/// Emit the final short limiter block after the last TrueHD input frame.
+pub unsafe extern "C" fn starmine_ad_truehd_renderer_714_flush(
+    renderer: *mut StarmineAdTrueHdRenderer714Handle,
+    out_frame: *mut StarmineAdRender714Frame,
+) -> StarmineAdStatus {
+    let Some(renderer) = (unsafe { renderer.as_mut() }) else {
+        return StarmineAdStatus::NullPointer;
+    };
+    let Some(out_frame) = (unsafe { out_frame.as_mut() }) else {
+        return StarmineAdStatus::NullPointer;
+    };
+
+    *out_frame = StarmineAdRender714Frame::empty();
+    renderer.flush();
+    if let Some(frame) = renderer.last_rendered.as_ref() {
+        *out_frame = StarmineAdRender714Frame::from(frame);
+    }
+    StarmineAdStatus::Ok
 }
 
 #[unsafe(no_mangle)]
@@ -513,20 +954,24 @@ pub extern "C" fn starmine_ad_status_string(status: StarmineAdStatus) -> *const 
         StarmineAdStatus::UnsupportedBedChannel => STATUS_UNSUPPORTED_BED_CHANNEL.as_ptr(),
         StarmineAdStatus::SampleRateChanged => STATUS_SAMPLE_RATE_CHANGED.as_ptr(),
         StarmineAdStatus::BedChannelCountMismatch => STATUS_BED_CHANNEL_COUNT_MISMATCH.as_ptr(),
+        StarmineAdStatus::TrueHdParse => STATUS_TRUEHD_PARSE.as_ptr(),
+        StarmineAdStatus::TrueHdDecode => STATUS_TRUEHD_DECODE.as_ptr(),
+        StarmineAdStatus::TrueHdUnsupportedLayout => STATUS_TRUEHD_UNSUPPORTED_LAYOUT.as_ptr(),
+        StarmineAdStatus::TrueHdInvalidMetadata => STATUS_TRUEHD_INVALID_METADATA.as_ptr(),
     }
     .cast::<c_char>()
 }
 
 #[unsafe(no_mangle)]
-/// Initialize an info struct to zero / empty defaults.
-pub extern "C" fn starmine_ad_access_unit_info_init(
-    out_info: *mut StarmineAdAccessUnitInfo,
+/// Initialize an E-AC-3 info struct to zero / empty defaults.
+pub extern "C" fn starmine_ad_eac3_access_unit_info_init(
+    out_info: *mut StarmineAdEac3AccessUnitInfo,
 ) -> StarmineAdStatus {
     let Some(out_info) = ptr::NonNull::new(out_info) else {
         return StarmineAdStatus::NullPointer;
     };
     unsafe {
-        out_info.as_ptr().write(StarmineAdAccessUnitInfo {
+        out_info.as_ptr().write(StarmineAdEac3AccessUnitInfo {
             frame_size: 0,
             bitstream_id: 0,
             frame_type: 0,
@@ -547,6 +992,36 @@ pub extern "C" fn starmine_ad_access_unit_info_init(
             first_emdf_sync_offset: 0,
             frames_seen: 0,
         });
+    }
+    StarmineAdStatus::Ok
+}
+
+#[unsafe(no_mangle)]
+/// Initialize a TrueHD info struct to zero / empty defaults.
+pub extern "C" fn starmine_ad_truehd_access_unit_info_init(
+    out_info: *mut StarmineAdTrueHdAccessUnitInfo,
+) -> StarmineAdStatus {
+    let Some(out_info) = ptr::NonNull::new(out_info) else {
+        return StarmineAdStatus::NullPointer;
+    };
+    unsafe {
+        out_info
+            .as_ptr()
+            .write(StarmineAdTrueHdAccessUnitInfo::empty());
+    }
+    StarmineAdStatus::Ok
+}
+
+#[unsafe(no_mangle)]
+/// Initialize an object-PCM frame struct to the empty / no-output state.
+pub extern "C" fn starmine_ad_object_pcm_frame_init(
+    out_frame: *mut StarmineAdObjectPcmFrame,
+) -> StarmineAdStatus {
+    let Some(out_frame) = ptr::NonNull::new(out_frame) else {
+        return StarmineAdStatus::NullPointer;
+    };
+    unsafe {
+        out_frame.as_ptr().write(StarmineAdObjectPcmFrame::empty());
     }
     StarmineAdStatus::Ok
 }

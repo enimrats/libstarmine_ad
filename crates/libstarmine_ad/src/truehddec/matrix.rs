@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Derived from `truehdd`; modified for `libstarmine_ad`.
+
 //! Matrix operations for lossless multi-channel decorrelation.
 //!
 //! TrueHD uses matrix operations to remove correlation between audio channels.

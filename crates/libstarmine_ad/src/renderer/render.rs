@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use super::render_input::{
     RenderInputFrame, RenderMetadata, RenderMetadataElement, RenderMetadataObject,
     RenderMetadataUpdate,

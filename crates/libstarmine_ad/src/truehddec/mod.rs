@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Derived from `truehdd`; modified for `libstarmine_ad`.
+
 mod decoder;
 mod render_bridge;
 

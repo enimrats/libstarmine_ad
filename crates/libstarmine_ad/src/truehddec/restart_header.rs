@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Derived from `truehdd`; modified for `libstarmine_ad`.
+
 //! Restart header structures and decoder initialization.
 //!
 //! Restart headers provide decoder initialization and recovery points within TrueHD streams.

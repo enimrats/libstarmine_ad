@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Derived from `truehdd`; modified for `libstarmine_ad`.
+
 //! Audio block structures and compression parameters.
 //!
 //! TrueHD audio compression operates on blocks containing 8-160 samples per channel.

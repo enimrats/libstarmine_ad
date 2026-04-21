@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Derived from `truehdd`; modified for `libstarmine_ad`.
+
 use thiserror::Error;
 
 const MAJOR_SYNC_FBA: [u8; 4] = [0xF8, 0x72, 0x6F, 0xBA];

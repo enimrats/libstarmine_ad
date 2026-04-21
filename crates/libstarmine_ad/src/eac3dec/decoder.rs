@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use super::metadata::MetadataParseState;
 use super::syncframe::{AccessUnitInfo, ParseError, inspect_access_unit_with_metadata_state};
 

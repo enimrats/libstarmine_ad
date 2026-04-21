@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+//
 //! Stateful E-AC-3 object-audio decoding and 7.1.4 rendering.
 //!
 //! The crate is split into two main namespaces:
@@ -48,6 +50,14 @@
 //!
 //! The render paths export borrowed planar `float` pointers whose lifetime is tied to the owning
 //! handle. A libav-based end-to-end C example lives under `Starmine_ad/examples/`.
+//!
+//! # License
+//!
+//! `libstarmine_ad` is distributed under the Apache License, Version 2.0.
+//! The TrueHD-related sources under [`truehddec`] and the CLI helper
+//! `src/bin/starmine-ad-cli/raw_truehd.rs` are derived from the Apache-2.0
+//! licensed `truehdd` project and include local modifications. Those
+//! source files are marked inline; see the repository-root `LICENSE`.
 
 pub mod eac3dec;
 mod ffi;

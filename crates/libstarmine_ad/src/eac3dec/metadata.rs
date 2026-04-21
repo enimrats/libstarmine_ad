@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use super::bitstream::BitReader;
 use super::syncframe::ParseError;
 use crate::renderer::{BedChannel, ObjectAnchor, Vec3};

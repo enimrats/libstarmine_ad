@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use super::metadata::{OamdElementKind, OamdObjectBlock, OamdPayload};
 use super::pcm::{CorePcmFrame, ObjectPcmFrame};
 use crate::renderer::{

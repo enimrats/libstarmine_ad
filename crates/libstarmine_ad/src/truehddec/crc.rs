@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Derived from `truehdd`; modified for `libstarmine_ad`.
+
 //! CRC validation utilities for audio bitstreams.
 //!
 //! Provides CRC-8 and CRC-16 implementations with format-specific algorithms

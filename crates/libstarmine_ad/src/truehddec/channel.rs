@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Derived from `truehdd`; modified for `libstarmine_ad`.
+
 //! Channel configuration and parameter structures.
 //!
 //! Contains channel assignments, filter coefficients, and audio

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Derived from `truehdd`; modified for `libstarmine_ad`.
+
 //! Bitstream I/O utilities for audio parsing.
 //!
 //! Provides bitstream reading, Huffman decoding, CRC validation,

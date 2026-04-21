@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 #![allow(clippy::collapsible_if)]
 
 mod raw_eac3;

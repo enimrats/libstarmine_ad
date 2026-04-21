@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Derived from `truehdd`; modified for `libstarmine_ad`.
+
 //! Dithering utilities for audio processing.
 //!
 //! Provides dither generation functions and lookup tables used in

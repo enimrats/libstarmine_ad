@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use std::f32::consts::PI;
 use std::sync::{Arc, OnceLock};
 

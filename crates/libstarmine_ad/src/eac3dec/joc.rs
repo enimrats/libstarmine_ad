@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 #![allow(clippy::needless_range_loop)]
 
 use std::sync::OnceLock;

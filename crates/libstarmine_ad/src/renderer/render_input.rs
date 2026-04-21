@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use super::types::{BedChannel, ObjectAnchor, Vec3};
 
 #[derive(Debug, Clone, PartialEq)]

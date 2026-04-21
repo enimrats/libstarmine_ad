@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Derived from `truehdd`; modified for `libstarmine_ad`.
+
 //! Substream structures and multi-presentation organization.
 //!
 //! TrueHD bitstreams support up to 4 substreams carrying different audio presentations.

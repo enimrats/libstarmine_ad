@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Derived from `truehdd`; modified for `libstarmine_ad`.
+
 use crate::renderer::{
     BedChannel, ObjectAnchor, RenderMetadata, RenderMetadataBlockUpdate, RenderMetadataElement,
     RenderMetadataObject, RenderMetadataUpdate, Vec3,

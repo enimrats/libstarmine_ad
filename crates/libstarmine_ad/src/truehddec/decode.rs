@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Derived from `truehdd`; modified for `libstarmine_ad`.
+
 use crate::truehddec::process::{MAX_PRESENTATIONS, PresentationMap, PresentationType};
 use crate::truehddec::simd::{dot_product_i32_prefix, dual_dot_product_i32_prefix};
 use crate::truehddec::structs::access_unit::AccessUnit;

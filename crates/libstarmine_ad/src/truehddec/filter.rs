@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Derived from `truehdd`; modified for `libstarmine_ad`.
+
 //! Filtering for predictive audio compression.
 //!
 //! TrueHD uses adaptive FIR filters to remove temporal redundancy from audio signals.

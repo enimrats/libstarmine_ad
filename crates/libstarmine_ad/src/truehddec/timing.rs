@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Derived from `truehdd`; modified for `libstarmine_ad`.
+
 //! Timing utilities for high-resolution output timing.
 //!
 //! Provides timing trait implementations and high-resolution timing

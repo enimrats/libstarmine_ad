@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use super::joc::{JocObjectDecoderState, JocObjectMatrices};
 use super::metadata::{JocPayload, MetadataParseState, OamdPayload, ParsedEmdfPayloadData};
 use super::syncframe::{

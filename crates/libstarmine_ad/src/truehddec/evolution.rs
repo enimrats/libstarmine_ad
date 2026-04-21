@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Derived from `truehdd`; modified for `libstarmine_ad`.
+
 //! Evolution Frame structures
 //!
 //! This module contains structures for handling Evolution frames,

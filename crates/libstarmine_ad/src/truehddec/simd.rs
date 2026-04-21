@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Derived from `truehdd`; modified for `libstarmine_ad`.
+
 #[inline]
 pub(crate) fn dot_product_i32_prefix<const N: usize>(
     lhs: &[i32; N],

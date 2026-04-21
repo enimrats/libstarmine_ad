@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: Apache-2.0
+
 use starmine_ad::eac3dec::{ParseError, inspect_access_unit};
 
 pub struct RawEac3Frame<'a> {

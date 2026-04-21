@@ -1,3 +1,5 @@
+#![allow(clippy::needless_range_loop)]
+
 use std::sync::OnceLock;
 
 use crate::metadata::{BedChannel, JocObject, JocObjectData, JocPayload};
@@ -79,7 +81,7 @@ impl JocObjectDecoderState {
             return Err(ParseError::UnsupportedFeature("joc-channel-count"));
         }
         let samples = core.samples_per_channel();
-        if samples == 0 || samples % QMF_SUBBANDS != 0 {
+        if samples == 0 || !samples.is_multiple_of(QMF_SUBBANDS) {
             return Err(ParseError::InvalidHeader("joc-frame-samples"));
         }
 

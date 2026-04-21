@@ -1,3 +1,5 @@
+#![allow(clippy::excessive_precision, clippy::items_after_test_module)]
+
 use std::sync::OnceLock;
 
 #[cfg(target_arch = "aarch64")]
@@ -121,6 +123,7 @@ fn dot_product(lhs: &[f32; QMF_DOUBLE_LENGTH], rhs: &[f32; QMF_DOUBLE_LENGTH]) -
     }
 }
 
+#[cfg(any(test, not(target_arch = "aarch64")))]
 fn dot_product_scalar(lhs: &[f32], rhs: &[f32]) -> f32 {
     let mut sum = 0.0f32;
     for index in 0..lhs.len() {

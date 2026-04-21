@@ -1,5 +1,7 @@
-use crate::metadata::{
-    BedChannel, OamdElementKind, OamdObjectBlock, OamdPayload, ObjectAnchor, Vec3,
+use crate::metadata::{BedChannel, ObjectAnchor, Vec3};
+use crate::render_input::{
+    RenderInputFrame, RenderMetadata, RenderMetadataElement, RenderMetadataObject,
+    RenderMetadataUpdate,
 };
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::{
@@ -111,26 +113,6 @@ const RENDER_714_CHANNEL_POSITIONS: [Vec3; RENDER_714_CHANNELS] = [
 ];
 
 #[derive(Debug, Clone, PartialEq)]
-/// One labeled bed channel carried by a [`RenderInputFrame`].
-pub struct RenderInputChannel {
-    pub channel: BedChannel,
-    pub samples: Vec<f32>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-/// Codec-agnostic input frame for [`Renderer714`].
-///
-/// Bed signals are passed as explicitly labeled channels, while `object_channels` only contains
-/// dynamic objects whose positions are described by `oamd`.
-pub struct RenderInputFrame {
-    pub sample_rate: u32,
-    pub bed_channels: Vec<RenderInputChannel>,
-    pub object_channels: Vec<Vec<f32>>,
-    pub oamd: Option<OamdPayload>,
-    pub oamd_sample_offset: Option<u16>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
 /// One rendered 7.1.4 frame.
 pub struct Render714Frame {
     pub sample_rate: u32,
@@ -155,27 +137,6 @@ pub struct Render714SourceDebug {
 pub struct Render714TimeslotDebug {
     pub sample_offset: usize,
     pub sources: Vec<Render714SourceDebug>,
-}
-
-impl RenderInputFrame {
-    /// Number of samples carried by each input channel.
-    pub fn samples_per_channel(&self) -> usize {
-        self.bed_channels
-            .first()
-            .map(|channel| channel.samples.len())
-            .or_else(|| self.object_channels.first().map(Vec::len))
-            .unwrap_or(0)
-    }
-
-    /// Number of bed channels in this frame.
-    pub fn bed_channel_count(&self) -> usize {
-        self.bed_channels.len()
-    }
-
-    /// Number of dynamic object channels in this frame.
-    pub fn object_count(&self) -> usize {
-        self.object_channels.len()
-    }
 }
 
 impl Render714Frame {
@@ -248,8 +209,7 @@ struct RenderInputFrameRef<'a> {
     sample_rate: u32,
     bed_channels: &'a [RenderInputChannelRef<'a>],
     object_channels: &'a [&'a [f32]],
-    oamd: Option<&'a OamdPayload>,
-    oamd_sample_offset: Option<u16>,
+    metadata_updates: &'a [RenderMetadataUpdate],
 }
 
 impl RenderInputFrameRef<'_> {
@@ -271,10 +231,11 @@ impl RenderInputFrameRef<'_> {
 pub struct Renderer714 {
     sample_rate: Option<u32>,
     limiter_gain: f32,
+    stream_sample_offset: i64,
     metadata_timeslot_phase: usize,
-    metadata_timeslot_timecode: i32,
+    metadata_timeslot_stream_sample: i64,
     lfe_lowpass: Option<BiquadLowpassState>,
-    metadata: OamdRendererState,
+    metadata: MetadataRendererState,
     limiter_pending: Vec<Vec<f32>>,
     pending_timeslot_debug: Vec<Render714TimeslotDebug>,
 }
@@ -284,10 +245,11 @@ impl Default for Renderer714 {
         Self {
             sample_rate: None,
             limiter_gain: 1.0,
+            stream_sample_offset: 0,
             metadata_timeslot_phase: 0,
-            metadata_timeslot_timecode: 0,
+            metadata_timeslot_stream_sample: 0,
             lfe_lowpass: None,
-            metadata: OamdRendererState::default(),
+            metadata: MetadataRendererState::default(),
             limiter_pending: vec![Vec::new(); RENDER_714_CHANNELS],
             pending_timeslot_debug: Vec::new(),
         }
@@ -304,8 +266,9 @@ impl Renderer714 {
     pub fn reset(&mut self) {
         self.sample_rate = None;
         self.limiter_gain = 1.0;
+        self.stream_sample_offset = 0;
         self.metadata_timeslot_phase = 0;
-        self.metadata_timeslot_timecode = 0;
+        self.metadata_timeslot_stream_sample = 0;
         self.lfe_lowpass = None;
         self.metadata.reset();
         for channel in &mut self.limiter_pending {
@@ -411,26 +374,33 @@ impl Renderer714 {
             Some(_) => {}
         }
 
-        if let Some(oamd) = frame.oamd {
-            self.metadata.apply_payload(oamd, frame.oamd_sample_offset);
-            self.metadata_timeslot_phase = 0;
-            self.metadata_timeslot_timecode = 0;
-        } else if !self.metadata.initialized {
+        let frame_stream_start = self.stream_sample_offset;
+        let mut metadata_updates = frame.metadata_updates.iter().collect::<Vec<_>>();
+        metadata_updates.sort_by_key(|update| update.sample_offset);
+        let mut next_metadata_update = 0usize;
+        if !self.metadata.initialized && metadata_updates.is_empty() {
             return Err(Render714Error::MissingOamd);
         }
-
-        if !self.metadata.initialized {
-            return Err(Render714Error::OamdStateUninitialized);
+        while let Some(update) = metadata_updates.get(next_metadata_update) {
+            if update.sample_offset != 0 {
+                break;
+            }
+            let was_initialized = self.metadata.initialized;
+            self.metadata.apply_update(
+                &update.metadata,
+                frame_stream_start + i64::from(update.sample_offset),
+            );
+            if !was_initialized {
+                self.metadata_timeslot_phase = 0;
+                self.metadata_timeslot_stream_sample =
+                    frame_stream_start + i64::from(update.sample_offset);
+            }
+            self.validate_dynamic_object_count(frame.object_channels.len())?;
+            next_metadata_update += 1;
         }
-
-        // OAMD bed object cardinality does not necessarily match the decoded PCM bed-channel
-        // count, so we only validate the dynamic object side here.
-        let dynamic_object_count = self.metadata.dynamic_object_count();
-        if dynamic_object_count != frame.object_channels.len() {
-            return Err(Render714Error::ObjectCountMismatch {
-                expected: dynamic_object_count,
-                provided: frame.object_channels.len(),
-            });
+        if next_metadata_update > 0 {
+            self.metadata_timeslot_phase = 0;
+            self.metadata_timeslot_stream_sample = frame_stream_start;
         }
 
         let samples = validate_render_input_sample_counts(frame)?;
@@ -439,25 +409,71 @@ impl Renderer714 {
         }
         debug.reserve(samples.div_ceil(RENDER_TIMESLOT_SAMPLES) + 1);
 
+        if self.metadata.initialized {
+            self.validate_dynamic_object_count(frame.object_channels.len())?;
+        }
+
         prepare_render_channels(channels, samples);
-        mix_bed_objects_to_714(
-            frame.bed_channels,
-            &self.metadata.bed_channels,
-            self.metadata.bed_sources(),
-            channels,
-        )?;
 
         let mut sample_offset = 0usize;
         while sample_offset < samples {
+            while let Some(update) = metadata_updates.get(next_metadata_update) {
+                if usize::from(update.sample_offset) > sample_offset {
+                    break;
+                }
+                let was_initialized = self.metadata.initialized;
+                self.metadata.apply_update(
+                    &update.metadata,
+                    frame_stream_start + i64::from(update.sample_offset),
+                );
+                if !was_initialized {
+                    self.metadata_timeslot_phase = 0;
+                    self.metadata_timeslot_stream_sample =
+                        frame_stream_start + i64::from(update.sample_offset);
+                }
+                self.validate_dynamic_object_count(frame.object_channels.len())?;
+                next_metadata_update += 1;
+            }
+
+            if !self.metadata.initialized {
+                // Keep startup output silent until the first metadata payload becomes active.
+                let sample_end = metadata_updates
+                    .get(next_metadata_update)
+                    .map(|update| usize::from(update.sample_offset).min(samples))
+                    .unwrap_or(samples);
+                if sample_end <= sample_offset {
+                    return Err(Render714Error::OamdStateUninitialized);
+                }
+                sample_offset = sample_end;
+                continue;
+            }
+
             if self.metadata_timeslot_phase == 0 {
-                self.metadata
-                    .update_timeslot(self.metadata_timeslot_timecode, RENDER_TIMESLOT_SAMPLES);
+                self.metadata.update_timeslot(
+                    self.metadata_timeslot_stream_sample,
+                    RENDER_TIMESLOT_SAMPLES,
+                );
                 debug.push(self.capture_timeslot_debug(sample_offset));
             }
-            let sample_end = sample_offset
+            let mut sample_end = sample_offset
                 + (RENDER_TIMESLOT_SAMPLES - self.metadata_timeslot_phase)
                     .min(samples - sample_offset);
+            if let Some(update) = metadata_updates.get(next_metadata_update) {
+                let update_offset = usize::from(update.sample_offset);
+                if update_offset > sample_offset {
+                    sample_end = sample_end.min(update_offset.min(samples));
+                }
+            }
             let timeslot_samples = sample_end - sample_offset;
+
+            mix_bed_objects_segment_to_714(
+                frame.bed_channels,
+                &self.metadata.bed_channels,
+                self.metadata.bed_sources(),
+                channels,
+                sample_offset,
+                timeslot_samples,
+            )?;
 
             for (object_index, object_samples) in frame.object_channels.iter().enumerate() {
                 let source = &self.metadata.dynamic_sources[object_index];
@@ -472,15 +488,33 @@ impl Renderer714 {
             self.metadata_timeslot_phase += timeslot_samples;
             if self.metadata_timeslot_phase == RENDER_TIMESLOT_SAMPLES {
                 self.metadata_timeslot_phase = 0;
-                self.metadata_timeslot_timecode += RENDER_TIMESLOT_SAMPLES as i32;
+                self.metadata_timeslot_stream_sample += RENDER_TIMESLOT_SAMPLES as i64;
             }
             sample_offset = sample_end;
         }
+
+        self.stream_sample_offset += samples as i64;
 
         if let Some(lfe_lowpass) = self.lfe_lowpass.as_mut() {
             lfe_lowpass.process_in_place(&mut channels[RENDER_714_LFE_INDEX]);
         }
 
+        Ok(())
+    }
+
+    fn validate_dynamic_object_count(
+        &self,
+        provided_dynamic_objects: usize,
+    ) -> Result<(), Render714Error> {
+        // Metadata bed object cardinality does not necessarily match the decoded PCM bed-channel
+        // count, so we only validate the dynamic object side here.
+        let expected_dynamic_objects = self.metadata.dynamic_object_count();
+        if expected_dynamic_objects != provided_dynamic_objects {
+            return Err(Render714Error::ObjectCountMismatch {
+                expected: expected_dynamic_objects,
+                provided: provided_dynamic_objects,
+            });
+        }
         Ok(())
     }
 
@@ -700,9 +734,9 @@ impl BiquadLowpassState {
 }
 
 #[derive(Debug, Default)]
-struct OamdRendererState {
+struct MetadataRendererState {
     initialized: bool,
-    sample_offset: i32,
+    payload_stream_sample: i64,
     object_count: usize,
     bed_or_isf_objects: usize,
     bed_channels: Vec<BedChannel>,
@@ -711,43 +745,37 @@ struct OamdRendererState {
     dynamic_sources: Vec<DynamicSourceState>,
 }
 
-impl OamdRendererState {
+impl MetadataRendererState {
     fn reset(&mut self) {
         *self = Self::default();
     }
 
-    fn apply_payload(&mut self, payload: &OamdPayload, sample_offset: Option<u16>) {
+    fn apply_update(&mut self, metadata: &RenderMetadata, payload_stream_sample: i64) {
         self.initialized = true;
-        self.sample_offset = sample_offset.unwrap_or_default() as i32;
-        self.object_count = payload.object_count;
-        self.bed_or_isf_objects = payload.bed_or_isf_objects;
-        self.bed_channels = payload
-            .bed_assignment
-            .iter()
-            .flat_map(|instance| instance.iter().copied())
-            .collect();
+        self.payload_stream_sample = payload_stream_sample;
+        self.object_count = metadata.object_count;
+        self.bed_or_isf_objects = metadata.bed_or_isf_objects;
+        self.bed_channels = metadata.bed_channels.clone();
         // TODO: Revalidate multi-bed instance handling when a stream with multiple non-LFE bed
         // instances is available.
 
-        let dynamic_object_count = payload
-            .object_count
-            .saturating_sub(payload.bed_or_isf_objects);
+        let dynamic_object_count = metadata.dynamic_object_count();
         if self.dynamic_sources.len() != dynamic_object_count {
             self.dynamic_sources = vec![DynamicSourceState::default(); dynamic_object_count];
         }
-        if self.bed_sources.len() != payload.beds {
-            self.bed_sources = vec![BedSourceState::default(); payload.beds];
+        if self.bed_sources.len() != metadata.bed_channels.len() {
+            self.bed_sources = vec![BedSourceState::default(); metadata.bed_channels.len()];
         }
 
-        if self.elements.len() != payload.element_count {
-            self.elements = vec![ElementRendererState::default(); payload.element_count];
+        if self.elements.len() != metadata.elements.len() {
+            self.elements = vec![ElementRendererState::default(); metadata.elements.len()];
         }
 
-        for (index, element) in payload.elements.iter().enumerate() {
+        for (index, element) in metadata.elements.iter().enumerate() {
             self.elements[index].apply_element(
                 element,
-                payload.object_count,
-                payload.bed_or_isf_objects,
+                metadata.object_count,
+                metadata.bed_or_isf_objects,
             );
         }
     }
@@ -760,8 +788,8 @@ impl OamdRendererState {
         &self.bed_sources
     }
 
-    fn update_timeslot(&mut self, timecode: i32, timeslot_samples: usize) {
-        let adjusted = timecode - self.sample_offset;
+    fn update_timeslot(&mut self, timeslot_stream_sample: i64, timeslot_samples: usize) {
+        let adjusted = timeslot_stream_sample - self.payload_stream_sample;
         let mut element_index = 0usize;
         for index in (0..self.elements.len()).rev() {
             if self.elements[index].min_offset >= 0 && self.elements[index].min_offset <= adjusted {
@@ -783,15 +811,15 @@ impl OamdRendererState {
 
 #[derive(Debug, Clone)]
 struct ElementRendererState {
-    min_offset: i32,
+    min_offset: i64,
     block_used: Vec<bool>,
     update_last: Vec<bool>,
     update_now: Vec<bool>,
-    block_offsets: Vec<i32>,
-    ramp_duration: Vec<i32>,
+    block_offsets: Vec<i64>,
+    ramp_duration: Vec<i64>,
     info_blocks: Vec<Vec<ObjectInfoBlockState>>,
     future: Vec<Vec3>,
-    future_distance: i32,
+    future_distance: i64,
 }
 
 impl Default for ElementRendererState {
@@ -813,19 +841,11 @@ impl Default for ElementRendererState {
 impl ElementRendererState {
     fn apply_element(
         &mut self,
-        element: &crate::metadata::OamdElement,
+        element: &RenderMetadataElement,
         object_count: usize,
         bed_or_isf_objects: usize,
     ) {
-        let OamdElementKind::Object(object_element) = &element.kind else {
-            self.min_offset = -1;
-            self.block_used.clear();
-            self.block_offsets.clear();
-            self.ramp_duration.clear();
-            return;
-        };
-
-        let block_count = object_element.block_updates.len();
+        let block_count = element.block_updates.len();
         let dynamic_object_count = object_count.saturating_sub(bed_or_isf_objects);
         if self.block_used.len() != block_count || self.info_blocks.len() != object_count {
             self.block_used = vec![false; block_count];
@@ -841,16 +861,16 @@ impl ElementRendererState {
             self.block_used.fill(false);
         }
 
-        for (index, update) in object_element.block_updates.iter().enumerate() {
-            self.block_offsets[index] = update.offset as i32;
-            self.ramp_duration[index] = update.ramp_duration as i32;
+        for (index, update) in element.block_updates.iter().enumerate() {
+            self.block_offsets[index] = update.offset;
+            self.ramp_duration[index] = update.ramp_duration;
         }
         self.min_offset = self.block_offsets.first().copied().unwrap_or(-1);
 
         for object_index in 0..object_count {
             for block_index in 0..block_count {
                 self.info_blocks[object_index][block_index].apply_parsed_update(
-                    &object_element.object_blocks[object_index][block_index],
+                    &element.object_blocks[object_index][block_index],
                     object_index < bed_or_isf_objects,
                 );
             }
@@ -859,7 +879,7 @@ impl ElementRendererState {
 
     fn update_sources(
         &mut self,
-        timecode: i32,
+        timecode: i64,
         timeslot_samples: usize,
         bed_or_isf_objects: usize,
         bed_sources: &mut [BedSourceState],
@@ -908,7 +928,7 @@ impl ElementRendererState {
                     source.position_valid = true;
                 }
             }
-            self.future_distance -= timeslot_samples as i32;
+            self.future_distance -= timeslot_samples as i64;
         }
     }
 }
@@ -945,55 +965,24 @@ impl Default for ObjectInfoBlockState {
 }
 
 impl ObjectInfoBlockState {
-    fn apply_parsed_update(&mut self, parsed: &OamdObjectBlock, bed_or_isf_object: bool) {
-        let inactive = parsed.inactive;
-        let basic_info_status = if inactive {
-            0
-        } else {
-            parsed.basic_info_status
-        };
-        if (basic_info_status & 1) != 0 {
-            if let Some(gain) = parsed.gain {
-                self.gain = Some(gain);
-            }
+    fn apply_parsed_update(&mut self, parsed: &RenderMetadataObject, bed_or_isf_object: bool) {
+        self.gain = parsed.gain;
+        self.valid_position = parsed.position_valid;
+        self.differential_position = parsed.differential_position;
+        if let Some(position) = parsed.position {
+            self.position = position;
         }
-
-        let render_info_status = if inactive || bed_or_isf_object {
-            0
-        } else {
-            parsed.render_info_status
-        };
-        if (render_info_status & 1) != 0 {
-            let blocks = parsed
-                .render_info_blocks
-                .unwrap_or(if render_info_status == 1 { 15 } else { 0 });
-            self.valid_position = (blocks & 1) != 0;
-            if self.valid_position {
-                self.differential_position = parsed.differential_position;
-                if let Some(position) = parsed.position {
-                    self.position = position;
-                }
-                self.distance = parsed.distance.map(|distance| {
-                    if distance.is_infinite() {
-                        INFINITE_DISTANCE_FALLBACK
-                    } else {
-                        distance
-                    }
-                });
+        self.distance = parsed.distance.map(|distance| {
+            if distance.is_infinite() {
+                INFINITE_DISTANCE_FALLBACK
+            } else {
+                distance
             }
-
-            if (blocks & 4) != 0 {
-                if let Some(size) = parsed.size {
-                    self.size = Some(size);
-                }
-            }
-
-            if parsed.anchor == ObjectAnchor::Screen {
-                self.anchor = ObjectAnchor::Screen;
-                self.screen_factor = parsed.screen_factor.unwrap_or(1.0);
-                self.depth_factor = parsed.depth_factor.unwrap_or(1.0);
-            }
-        }
+        });
+        self.size = parsed.size;
+        self.anchor = parsed.anchor;
+        self.screen_factor = parsed.screen_factor;
+        self.depth_factor = parsed.depth_factor;
 
         if bed_or_isf_object {
             self.anchor = ObjectAnchor::Speaker;
@@ -1045,11 +1034,31 @@ impl ObjectInfoBlockState {
     }
 }
 
+#[cfg(test)]
 fn mix_bed_objects_to_714(
     input_bed_channels: &[RenderInputChannelRef<'_>],
     metadata_bed_channels: &[BedChannel],
     bed_sources: &[BedSourceState],
     output: &mut [Vec<f32>],
+) -> Result<(), Render714Error> {
+    let samples = output.first().map(Vec::len).unwrap_or(0);
+    mix_bed_objects_segment_to_714(
+        input_bed_channels,
+        metadata_bed_channels,
+        bed_sources,
+        output,
+        0,
+        samples,
+    )
+}
+
+fn mix_bed_objects_segment_to_714(
+    input_bed_channels: &[RenderInputChannelRef<'_>],
+    metadata_bed_channels: &[BedChannel],
+    bed_sources: &[BedSourceState],
+    output: &mut [Vec<f32>],
+    output_offset: usize,
+    samples: usize,
 ) -> Result<(), Render714Error> {
     if metadata_bed_channels.len() != bed_sources.len() {
         return Err(Render714Error::BedChannelCountMismatch {
@@ -1074,18 +1083,20 @@ fn mix_bed_objects_to_714(
                     .filter(|candidate| bed_channel_matches_input(bed_channel, candidate.channel))
                     .count(),
             })?;
+        let input_samples = &input_channel.samples[output_offset..output_offset + samples];
         match bed_channel {
             BedChannel::LowFrequencyEffects | BedChannel::LowFrequencyEffects2 => mix_full_channel(
-                input_channel.samples,
-                &mut output[RENDER_714_LFE_INDEX],
+                input_samples,
+                &mut output[RENDER_714_LFE_INDEX][output_offset..output_offset + samples],
                 source.gain * LFE_SEND_MINUS_10_DB,
             ),
             BedChannel::TopSurroundLeft
             | BedChannel::TopSurroundRight
             | BedChannel::WideLeft
             | BedChannel::WideRight => mix_folded_bed_channel_to_714(
-                input_channel.samples,
+                input_samples,
                 output,
+                output_offset,
                 bed_channel,
                 source.gain,
             ),
@@ -1093,8 +1104,8 @@ fn mix_bed_objects_to_714(
                 let output_channel = map_bed_channel_to_714(bed_channel)
                     .ok_or(Render714Error::UnsupportedBedChannel(bed_channel))?;
                 mix_full_channel(
-                    input_channel.samples,
-                    &mut output[output_channel],
+                    input_samples,
+                    &mut output[output_channel][output_offset..output_offset + samples],
                     source.gain,
                 );
             }
@@ -1137,6 +1148,7 @@ fn is_low_frequency_bed(channel: BedChannel) -> bool {
 fn mix_folded_bed_channel_to_714(
     input: &[f32],
     output: &mut [Vec<f32>],
+    output_offset: usize,
     channel: BedChannel,
     gain: f32,
 ) {
@@ -1146,7 +1158,7 @@ fn mix_folded_bed_channel_to_714(
         cubical_position: bed_channel_position(channel),
         position_valid: true,
     };
-    render_object_timeslot_to_714(input, output, 0, &source);
+    render_object_timeslot_to_714(input, output, output_offset, &source);
 }
 
 fn map_bed_channel_to_714(channel: BedChannel) -> Option<usize> {
@@ -1453,14 +1465,9 @@ fn render_object_timeslot_to_714(
     if size != 0.0 {
         inner_volume_3d *= 1.0 - size;
         let extra_channel_volume = source.gain * (size / RENDER_714_CHANNELS as f32).sqrt();
-        for channel_index in 0..RENDER_714_CHANNELS {
+        for (channel_index, channel_output) in output.iter_mut().enumerate() {
             if channel_index != RENDER_714_LFE_INDEX {
-                mix_segment(
-                    input,
-                    &mut output[channel_index],
-                    output_offset,
-                    extra_channel_volume,
-                );
+                mix_segment(input, channel_output, output_offset, extra_channel_volume);
             }
         }
     }
@@ -1697,7 +1704,6 @@ fn mix_add_scaled(input: &[f32], output: &mut [f32], gain: f32) {
     #[cfg(target_arch = "aarch64")]
     unsafe {
         mix_add_scaled_neon(input.as_ptr(), output.as_mut_ptr(), input.len(), gain);
-        return;
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
@@ -1710,7 +1716,7 @@ fn mix_add_scaled(input: &[f32], output: &mut [f32], gain: f32) {
 fn max_abs_slice(samples: &[f32]) -> f32 {
     #[cfg(target_arch = "aarch64")]
     unsafe {
-        return max_abs_slice_neon(samples.as_ptr(), samples.len());
+        max_abs_slice_neon(samples.as_ptr(), samples.len())
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
@@ -1729,7 +1735,6 @@ fn scale_slice_in_place(samples: &mut [f32], gain: f32) {
     #[cfg(target_arch = "aarch64")]
     unsafe {
         scale_slice_in_place_neon(samples.as_mut_ptr(), samples.len(), gain);
-        return;
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
@@ -1921,8 +1926,7 @@ fn render_input_from_frame<'a>(
         sample_rate: frame.sample_rate,
         bed_channels,
         object_channels,
-        oamd: frame.oamd.as_ref(),
-        oamd_sample_offset: frame.oamd_sample_offset,
+        metadata_updates: &frame.metadata_updates,
     }
 }
 
@@ -1952,14 +1956,15 @@ fn validate_render_input_sample_counts(
 mod tests {
     use super::{
         BedSourceState, DynamicSourceState, ElementRendererState, ObjectInfoBlockState,
-        RENDER_714_CHANNEL_ORDER, RENDER_714_CHANNELS, Render714Frame, RenderInputChannel,
-        RenderInputChannelRef, RenderInputFrame, Renderer714, apply_output_limiter,
+        RENDER_714_CHANNEL_ORDER, RENDER_714_CHANNELS, Render714Frame, RenderInputChannelRef,
+        RenderInputFrame, RenderMetadataUpdate, Renderer714, apply_output_limiter,
         map_bed_channel_to_714, mix_bed_objects_to_714, render_object_timeslot_to_714,
     };
     use crate::metadata::{
         BedChannel, OamdBlockUpdate, OamdElement, OamdElementKind, OamdObjectBlock,
         OamdObjectElement, OamdPayload, Vec3,
     };
+    use crate::render_input::{RenderInputChannel, RenderMetadata};
 
     fn concat_rendered_frames(frames: &[Render714Frame]) -> Vec<Vec<f32>> {
         let mut merged = vec![Vec::new(); RENDER_714_CHANNELS];
@@ -1988,6 +1993,12 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn metadata_updates_from_oamd(oamd: Option<OamdPayload>) -> Vec<RenderMetadataUpdate> {
+        oamd.as_ref()
+            .map(|payload| vec![RenderMetadataUpdate::from_oamd_payload(payload, Some(0))])
+            .unwrap_or_default()
     }
 
     #[test]
@@ -2023,7 +2034,7 @@ mod tests {
             future_distance: 0,
         };
         let mut bed_sources = vec![BedSourceState::default()];
-        let mut dynamic_sources = vec![DynamicSourceState::default(); 0];
+        let mut dynamic_sources = Vec::new();
 
         element.update_sources(1, 64, 1, &mut bed_sources, &mut dynamic_sources);
 
@@ -2051,7 +2062,7 @@ mod tests {
                 samples: vec![0.25; 65],
             }],
             object_channels: Vec::new(),
-            oamd: Some(OamdPayload {
+            metadata_updates: metadata_updates_from_oamd(Some(OamdPayload {
                 version: 0,
                 object_count: 1,
                 alternate_object_present: false,
@@ -2064,8 +2075,7 @@ mod tests {
                 isf_index: None,
                 bed_assignment: vec![vec![BedChannel::FrontLeft]],
                 elements: Vec::new(),
-            }),
-            oamd_sample_offset: Some(0),
+            })),
         };
 
         let mut renderer = Renderer714::new();
@@ -2097,7 +2107,7 @@ mod tests {
                 },
             ],
             object_channels: Vec::new(),
-            oamd: Some(OamdPayload {
+            metadata_updates: metadata_updates_from_oamd(Some(OamdPayload {
                 version: 0,
                 object_count: 2,
                 alternate_object_present: false,
@@ -2110,14 +2120,141 @@ mod tests {
                 isf_index: None,
                 bed_assignment: vec![vec![BedChannel::FrontLeft, BedChannel::FrontRight]],
                 elements: Vec::new(),
-            }),
-            oamd_sample_offset: Some(0),
+            })),
         };
 
         let err = Renderer714::new()
             .push_frame(&frame)
             .expect_err("mismatched channel lengths should fail");
         assert_eq!(err.to_string(), "unsupported-sample-count 64");
+    }
+
+    #[test]
+    fn metadata_update_mid_frame_remixes_bed_output() {
+        let metadata = |sample_offset: u16, bed_channel: BedChannel| RenderMetadataUpdate {
+            sample_offset,
+            metadata: RenderMetadata {
+                object_count: 1,
+                bed_or_isf_objects: 1,
+                bed_channels: vec![bed_channel],
+                elements: Vec::new(),
+            },
+        };
+        let frame = RenderInputFrame {
+            sample_rate: 48_000,
+            bed_channels: vec![
+                RenderInputChannel {
+                    channel: BedChannel::FrontLeft,
+                    samples: vec![0.25; 128],
+                },
+                RenderInputChannel {
+                    channel: BedChannel::FrontRight,
+                    samples: vec![0.5; 128],
+                },
+            ],
+            object_channels: Vec::new(),
+            metadata_updates: vec![
+                metadata(0, BedChannel::FrontLeft),
+                metadata(64, BedChannel::FrontRight),
+            ],
+        };
+
+        let rendered = Renderer714::new()
+            .push_frame(&frame)
+            .expect("bed metadata update should split the frame render");
+
+        assert!(rendered.channels[0][0] > 0.0);
+        assert!(rendered.channels[1][0].abs() < 1e-6);
+        assert!(rendered.channels[0][80].abs() < 1e-6);
+        assert!(rendered.channels[1][80] > 0.0);
+    }
+
+    #[test]
+    fn out_of_order_metadata_updates_render_like_sorted_updates() {
+        let metadata = |sample_offset: u16, bed_channel: BedChannel| RenderMetadataUpdate {
+            sample_offset,
+            metadata: RenderMetadata {
+                object_count: 1,
+                bed_or_isf_objects: 1,
+                bed_channels: vec![bed_channel],
+                elements: Vec::new(),
+            },
+        };
+        let bed_channels = vec![
+            RenderInputChannel {
+                channel: BedChannel::FrontLeft,
+                samples: vec![0.25; 128],
+            },
+            RenderInputChannel {
+                channel: BedChannel::FrontRight,
+                samples: vec![0.5; 128],
+            },
+        ];
+        let sorted = RenderInputFrame {
+            sample_rate: 48_000,
+            bed_channels: bed_channels.clone(),
+            object_channels: Vec::new(),
+            metadata_updates: vec![
+                metadata(0, BedChannel::FrontLeft),
+                metadata(64, BedChannel::FrontRight),
+            ],
+        };
+        let unsorted = RenderInputFrame {
+            sample_rate: 48_000,
+            bed_channels,
+            object_channels: Vec::new(),
+            metadata_updates: vec![
+                metadata(64, BedChannel::FrontRight),
+                metadata(0, BedChannel::FrontLeft),
+            ],
+        };
+
+        let expected = Renderer714::new()
+            .push_frame(&sorted)
+            .expect("sorted metadata updates should render");
+        let actual = Renderer714::new()
+            .push_frame(&unsorted)
+            .expect("out-of-order metadata updates should be normalized");
+
+        assert_channels_close(&actual.channels, &expected.channels);
+    }
+
+    #[test]
+    fn first_metadata_update_can_start_late_in_frame() {
+        let frame = RenderInputFrame {
+            sample_rate: 48_000,
+            bed_channels: vec![
+                RenderInputChannel {
+                    channel: BedChannel::FrontLeft,
+                    samples: vec![0.0; 64],
+                },
+                RenderInputChannel {
+                    channel: BedChannel::FrontRight,
+                    samples: vec![1.0; 64],
+                },
+            ],
+            object_channels: Vec::new(),
+            metadata_updates: vec![RenderMetadataUpdate {
+                sample_offset: 32,
+                metadata: RenderMetadata {
+                    object_count: 1,
+                    bed_or_isf_objects: 1,
+                    bed_channels: vec![BedChannel::FrontRight],
+                    elements: Vec::new(),
+                },
+            }],
+        };
+
+        let rendered = Renderer714::new()
+            .push_frame(&frame)
+            .expect("initial metadata update with non-zero sample offset should render");
+
+        for sample in 0..32 {
+            assert!(rendered.channels[0][sample].abs() < 1e-6);
+            assert!(rendered.channels[1][sample].abs() < 1e-6);
+        }
+        assert!(rendered.channels[0][48].abs() < 1e-6);
+        assert!(rendered.channels[1][48] > 0.0);
     }
 
     #[test]
@@ -2387,13 +2524,11 @@ mod tests {
         }
 
         fn test_frame(samples: usize, oamd: Option<OamdPayload>) -> RenderInputFrame {
-            let oamd_sample_offset = oamd.as_ref().map(|_| 0);
             RenderInputFrame {
                 sample_rate: 48_000,
                 bed_channels: Vec::new(),
                 object_channels: vec![vec![1.0; samples]],
-                oamd,
-                oamd_sample_offset,
+                metadata_updates: metadata_updates_from_oamd(oamd),
             }
         }
 
@@ -2475,13 +2610,11 @@ mod tests {
         }
 
         fn test_frame(samples: usize, oamd: Option<OamdPayload>) -> RenderInputFrame {
-            let oamd_sample_offset = oamd.as_ref().map(|_| 0);
             RenderInputFrame {
                 sample_rate: 48_000,
                 bed_channels: Vec::new(),
                 object_channels: vec![vec![1.0; samples]],
-                oamd,
-                oamd_sample_offset,
+                metadata_updates: metadata_updates_from_oamd(oamd),
             }
         }
 
@@ -2524,7 +2657,6 @@ mod tests {
         }
 
         fn bed_frame(samples: Vec<f32>, oamd: Option<OamdPayload>) -> RenderInputFrame {
-            let oamd_sample_offset = oamd.as_ref().map(|_| 0);
             RenderInputFrame {
                 sample_rate: 48_000,
                 bed_channels: vec![RenderInputChannel {
@@ -2532,8 +2664,7 @@ mod tests {
                     samples,
                 }],
                 object_channels: Vec::new(),
-                oamd,
-                oamd_sample_offset,
+                metadata_updates: metadata_updates_from_oamd(oamd),
             }
         }
 

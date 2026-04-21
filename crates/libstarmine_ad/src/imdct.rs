@@ -41,7 +41,7 @@ impl ImdctState {
             .ifft_512
             .process(&mut self.intermediate_512);
         for (value, coeff) in self.intermediate_512.iter_mut().zip(x.iter().copied()) {
-            *value = *value * coeff;
+            *value *= coeff;
         }
 
         for index in 0..64 {
@@ -64,8 +64,8 @@ impl ImdctState {
                 -self.intermediate_512[N4 - 1 - index].re * WINDOW[N4 - 2 - 2 * index];
         }
 
-        for index in 0..256 {
-            output[index] = 2.0 * (self.output[index] + self.delay[index]);
+        for (index, sample) in output.iter_mut().enumerate().take(256) {
+            *sample = 2.0 * (self.output[index] + self.delay[index]);
         }
         self.delay.copy_from_slice(&self.output[256..512]);
     }
@@ -78,10 +78,10 @@ impl ImdctState {
         fft.ifft_256.process(&mut self.intermediate_256_b);
         let x = x256();
         for (value, coeff) in self.intermediate_256_a.iter_mut().zip(x.iter().copied()) {
-            *value = *value * coeff;
+            *value *= coeff;
         }
         for (value, coeff) in self.intermediate_256_b.iter_mut().zip(x.iter().copied()) {
-            *value = *value * coeff;
+            *value *= coeff;
         }
 
         for index in 0..64 {
@@ -105,8 +105,8 @@ impl ImdctState {
                 -self.intermediate_256_b[N8 - 1 - index].re * WINDOW[N4 - 2 - 2 * index];
         }
 
-        for index in 0..256 {
-            output[index] = 2.0 * (self.output[index] + self.delay[index]);
+        for (index, sample) in output.iter_mut().enumerate().take(256) {
+            *sample = 2.0 * (self.output[index] + self.delay[index]);
         }
         self.delay.copy_from_slice(&self.output[256..512]);
     }
@@ -141,12 +141,12 @@ fn imdct_fft_cache() -> &'static ImdctFftCache {
 
 fn x512() -> &'static [Complex32; 128] {
     static X512: OnceLock<[Complex32; 128]> = OnceLock::new();
-    X512.get_or_init(|| create_coefficients::<128>())
+    X512.get_or_init(create_coefficients::<128>)
 }
 
 fn x256() -> &'static [Complex32; 64] {
     static X256: OnceLock<[Complex32; 64]> = OnceLock::new();
-    X256.get_or_init(|| create_coefficients::<64>())
+    X256.get_or_init(create_coefficients::<64>)
 }
 
 fn create_coefficients<const N: usize>() -> [Complex32; N] {
@@ -161,6 +161,7 @@ fn create_coefficients<const N: usize>() -> [Complex32; N] {
     result
 }
 
+#[allow(clippy::approx_constant)]
 const WINDOW: [f32; 256] = [
     0.00014, 0.00024, 0.00037, 0.00051, 0.00067, 0.00086, 0.00107, 0.00130, 0.00157, 0.00187,
     0.00220, 0.00256, 0.00297, 0.00341, 0.00390, 0.00443, 0.00501, 0.00564, 0.00632, 0.00706,

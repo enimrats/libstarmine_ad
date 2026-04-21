@@ -1,3 +1,4 @@
+use crate::adapter::render_input_from_eac3_parts;
 use std::ffi::c_char;
 use std::ptr;
 use std::slice;
@@ -8,10 +9,7 @@ use crate::syncframe::{
     AccessUnitInfo, CoreDecodeState, ParseError, decode_core_pcm_frame_with_state_into,
     inspect_access_unit_with_metadata_state,
 };
-use crate::{
-    CorePcmFrame, Decoder, PushResult, Render714Error, Render714Frame, RenderInputChannel,
-    RenderInputFrame, Renderer714,
-};
+use crate::{CorePcmFrame, Decoder, PushResult, Render714Error, Render714Frame, Renderer714};
 
 const STARMINE_AD_RENDER_714_CHANNELS: usize = 12;
 
@@ -356,21 +354,16 @@ impl StarmineAdRenderer714Handle {
             self.joc_state
                 .decode_frame_into(&self.core_pcm, joc, &mut self.object_channels)
                 .map_err(StarmineAdStatus::from_parse_error)?;
-            let oamd = info.payloads().find_map(|payload| match &payload.parsed {
-                ParsedEmdfPayloadData::Oamd(oamd) => Some(oamd),
-                _ => None,
-            });
-            let oamd_sample_offset = info.payloads().find_map(|payload| match &payload.parsed {
-                ParsedEmdfPayloadData::Oamd(_) => payload.info.sample_offset,
-                _ => None,
-            });
+            let oamd_payloads = info
+                .payloads()
+                .filter_map(|payload| match &payload.parsed {
+                    ParsedEmdfPayloadData::Oamd(oamd) => Some((oamd, payload.info.sample_offset)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
 
-            let input = render_input_frame_from_parts(
-                &self.core_pcm,
-                &self.object_channels,
-                oamd,
-                oamd_sample_offset,
-            );
+            let input =
+                render_input_from_eac3_parts(&self.core_pcm, &self.object_channels, &oamd_payloads);
             self.last_rendered = Some(
                 self.renderer
                     .push_frame(&input)
@@ -490,10 +483,10 @@ pub unsafe extern "C" fn starmine_ad_renderer_714_push_access_unit(
             if let Some(out_info) = unsafe { out_info.as_mut() } {
                 *out_info = StarmineAdAccessUnitInfo::from_parts(&info, renderer.frames_seen);
             }
-            if let Some(out_frame) = unsafe { out_frame.as_mut() } {
-                if let Some(frame) = renderer.last_rendered.as_ref() {
-                    *out_frame = StarmineAdRender714Frame::from(frame);
-                }
+            if let Some(out_frame) = unsafe { out_frame.as_mut() }
+                && let Some(frame) = renderer.last_rendered.as_ref()
+            {
+                *out_frame = StarmineAdRender714Frame::from(frame);
             }
             StarmineAdStatus::Ok
         }
@@ -523,41 +516,6 @@ pub extern "C" fn starmine_ad_status_string(status: StarmineAdStatus) -> *const 
         StarmineAdStatus::BedChannelCountMismatch => STATUS_BED_CHANNEL_COUNT_MISMATCH.as_ptr(),
     }
     .cast::<c_char>()
-}
-
-fn render_input_frame_from_parts(
-    core: &CorePcmFrame,
-    object_channels: &[Vec<f32>],
-    oamd: Option<&crate::OamdPayload>,
-    oamd_sample_offset: Option<u16>,
-) -> RenderInputFrame {
-    let mut bed_channels =
-        Vec::with_capacity(core.fullband_channels.len() + usize::from(core.lfe_channel.is_some()));
-    for (channel, samples) in core
-        .fullband_channel_order
-        .iter()
-        .copied()
-        .zip(core.fullband_channels.iter())
-    {
-        bed_channels.push(RenderInputChannel {
-            channel,
-            samples: samples.clone(),
-        });
-    }
-    if let Some(samples) = core.lfe_channel.as_ref() {
-        bed_channels.push(RenderInputChannel {
-            channel: BedChannel::LowFrequencyEffects,
-            samples: samples.clone(),
-        });
-    }
-
-    RenderInputFrame {
-        sample_rate: core.sample_rate,
-        bed_channels,
-        object_channels: object_channels.to_vec(),
-        oamd: oamd.cloned(),
-        oamd_sample_offset,
-    }
 }
 
 #[unsafe(no_mangle)]

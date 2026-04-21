@@ -1,3 +1,9 @@
+#![allow(
+    clippy::collapsible_if,
+    clippy::needless_range_loop,
+    clippy::too_many_arguments
+)]
+
 use std::fmt;
 
 use crate::allocation::{
@@ -577,12 +583,6 @@ impl CoreDecodeState {
             self.imdct = (0..fullband_channels).map(|_| ImdctState::new()).collect();
             self.lfe_imdct = lfe_on.then(ImdctState::new);
         }
-    }
-
-    fn block_syntax_mut(&mut self) -> Result<&mut BlockSyntaxState, ParseError> {
-        self.block_syntax
-            .as_mut()
-            .ok_or(ParseError::InvalidHeader("core-decode-state"))
     }
 }
 
@@ -2091,14 +2091,6 @@ fn consume_block_mantissas(
     }
 
     Ok(())
-}
-
-pub(crate) fn decode_core_pcm_frame(
-    frame: &[u8],
-    info: &AccessUnitInfo,
-) -> Result<CorePcmFrame, ParseError> {
-    let mut state = CoreDecodeState::default();
-    decode_core_pcm_frame_with_state(frame, info, &mut state)
 }
 
 pub(crate) fn decode_core_pcm_frame_with_state(

@@ -275,14 +275,6 @@ impl Default for OamdObjectBlockParseState {
     }
 }
 
-pub(crate) fn parse_emdf_payload_body(
-    payload_id: u8,
-    bytes: &[u8],
-) -> Result<ParsedEmdfPayloadData, ParseError> {
-    let mut state = MetadataParseState::default();
-    parse_emdf_payload_body_with_state(payload_id, bytes, &mut state)
-}
-
 pub(crate) fn parse_emdf_payload_body_with_state(
     payload_id: u8,
     bytes: &[u8],
@@ -376,10 +368,10 @@ impl OamdObjectBlockParseState {
                 .basic_info_blocks
                 .unwrap_or(if basic_info_status == 1 { 3 } else { 0 });
 
-            if (blocks & 2) != 0 {
-                if let Some(gain) = parsed.gain {
-                    self.gain = Some(gain);
-                }
+            if (blocks & 2) != 0
+                && let Some(gain) = parsed.gain
+            {
+                self.gain = Some(gain);
             }
 
             if (blocks & 1) != 0 && parsed.priority.is_some() {
@@ -406,10 +398,10 @@ impl OamdObjectBlockParseState {
                 self.distance = parsed.distance;
             }
 
-            if (blocks & 4) != 0 {
-                if let Some(size) = parsed.size {
-                    self.size = Some(size);
-                }
+            if (blocks & 4) != 0
+                && let Some(size) = parsed.size
+            {
+                self.size = Some(size);
             }
 
             if (blocks & 8) != 0 && parsed.anchor == ObjectAnchor::Screen {
@@ -767,10 +759,8 @@ fn parse_oamd_object_block(
             };
         }
 
-        if (blocks & 1) != 0 {
-            if !read_bit(reader, "oa_default_priority")? {
-                priority = Some(read_bits(reader, 5, "oa_priority")? as u8);
-            }
+        if (blocks & 1) != 0 && !read_bit(reader, "oa_default_priority")? {
+            priority = Some(read_bits(reader, 5, "oa_priority")? as u8);
         }
     }
 
@@ -1153,23 +1143,23 @@ fn huffman_table(mode: usize, kind: HuffmanType) -> &'static [[i16; 2]] {
     match kind {
         HuffmanType::Matrix => {
             if mode == 1 {
-                &JOC_HUFF_CODE_FINE_GENERIC
+                JOC_HUFF_CODE_FINE_GENERIC
             } else {
-                &JOC_HUFF_CODE_COARSE_GENERIC
+                JOC_HUFF_CODE_COARSE_GENERIC
             }
         }
         HuffmanType::Vector => {
             if mode == 1 {
-                &JOC_HUFF_CODE_FINE_COEFF_SPARSE
+                JOC_HUFF_CODE_FINE_COEFF_SPARSE
             } else {
-                &JOC_HUFF_CODE_COARSE_COEFF_SPARSE
+                JOC_HUFF_CODE_COARSE_COEFF_SPARSE
             }
         }
         HuffmanType::Index => {
             if mode == 7 {
-                &JOC_HUFF_CODE_7CH_POS_INDEX_SPARSE
+                JOC_HUFF_CODE_7CH_POS_INDEX_SPARSE
             } else {
-                &JOC_HUFF_CODE_5CH_POS_INDEX_SPARSE
+                JOC_HUFF_CODE_5CH_POS_INDEX_SPARSE
             }
         }
     }

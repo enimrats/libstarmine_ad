@@ -1,3 +1,5 @@
+#![allow(clippy::needless_range_loop, clippy::too_many_arguments)]
+
 use std::sync::OnceLock;
 
 use crate::syncframe::{ExpStrategy, ParseError};

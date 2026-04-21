@@ -6,8 +6,11 @@
 //!   syncframe / EMDF / payload metadata.
 //! - [`Decoder`] does the same thing statefully across frames and keeps cross-frame metadata
 //!   state in sync.
-//! - [`PcmDecoder`] adds decoded core PCM channels.
-//! - [`ObjectPcmDecoder`] adds decoded object PCM plus the parsed object metadata payloads.
+//! - [`PcmDecoder`] adds decoded E-AC-3 core PCM channels.
+//! - [`ObjectPcmDecoder`] adds decoded E-AC-3/JOC object PCM plus parsed E-AC-3 metadata payloads.
+//! - [`RenderInputFrame`] is the codec-neutral decoder-to-renderer contract.
+//! - [`RenderFrameSource`] and `to_render_input()` are the explicit adapter seam between a codec
+//!   decoder and the renderer.
 //! - [`Renderer714`] turns [`RenderInputFrame`] values into 7.1.4 float PCM.
 //!
 //! All decoders are stateful. Feed complete access units in stream order and call `reset()` after
@@ -17,14 +20,14 @@
 //!
 //! ```no_run
 //! use std::fs;
-//! use starmine_ad::{ObjectPcmDecoder, RenderInputFrame, Renderer714};
+//! use starmine_ad::{ObjectPcmDecoder, Renderer714};
 //!
 //! let access_unit = fs::read("frame.eac3")?;
 //! let mut decoder = ObjectPcmDecoder::new();
 //! let mut renderer = Renderer714::new();
 //!
 //! if let Some(result) = decoder.push_access_unit(&access_unit)? {
-//!     let input: RenderInputFrame = result.pcm.into();
+//!     let input = result.pcm.to_render_input();
 //!     let rendered = renderer.push_frame(&input)?;
 //!     assert_eq!(rendered.channel_count(), 12);
 //! }
@@ -48,6 +51,7 @@
 //! render path exports borrowed planar `float` pointers whose lifetime is tied to the renderer
 //! handle. A libav-based end-to-end C example lives under `Starmine_ad/examples/`.
 
+mod adapter;
 mod allocation;
 mod bitstream;
 mod decoder;
@@ -58,8 +62,10 @@ mod metadata;
 mod pcm;
 mod qmf;
 mod render;
+mod render_input;
 mod syncframe;
 
+pub use adapter::RenderFrameSource;
 pub use decoder::{Decoder, PushResult};
 pub use joc::{JocObjectMatrices, JocSubbandMatrix, JocTimeslotMatrices};
 pub use metadata::{
@@ -72,7 +78,11 @@ pub use pcm::{
 };
 pub use render::{
     RENDER_714_CHANNEL_ORDER, Render714Error, Render714Frame, Render714SourceDebug,
-    Render714TimeslotDebug, RenderInputChannel, RenderInputFrame, Renderer714,
+    Render714TimeslotDebug, Renderer714,
+};
+pub use render_input::{
+    RenderInputChannel, RenderInputFrame, RenderMetadata, RenderMetadataBlockUpdate,
+    RenderMetadataElement, RenderMetadataObject, RenderMetadataUpdate,
 };
 pub use syncframe::{
     AccessUnitInfo, AuxParseStatus, EmdfBlockInfo, EmdfPayloadInfo, FrameType, ParseError,

@@ -1,6 +1,8 @@
 use super::bitstream::BitReader;
 use super::syncframe::ParseError;
 use crate::renderer::{BedChannel, ObjectAnchor, Vec3};
+use std::fmt;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 const ISF_OBJECT_COUNT: [usize; 6] = [4, 8, 10, 14, 15, 30];
 const SAMPLE_OFFSET_INDEX: [u8; 4] = [8, 16, 18, 24];
@@ -394,15 +396,48 @@ impl OamdObjectBlockParseState {
     }
 }
 
-fn debug_metadata_enabled() -> bool {
-    #[cfg(debug_assertions)]
-    {
-        std::env::var_os("STARMINE_AD_DEBUG_METADATA").is_some()
+const LOG_LEVEL_ERROR: u8 = 1;
+const LOG_LEVEL_WARN: u8 = 2;
+const LOG_LEVEL_INFO: u8 = 3;
+const LOG_LEVEL_DEBUG: u8 = 4;
+const LOG_LEVEL_TRACE: u8 = 5;
+
+static METADATA_LOG_LEVEL: AtomicU8 = AtomicU8::new(LOG_LEVEL_DEBUG);
+
+const fn encode_log_level(level: log::Level) -> u8 {
+    match level {
+        log::Level::Error => LOG_LEVEL_ERROR,
+        log::Level::Warn => LOG_LEVEL_WARN,
+        log::Level::Info => LOG_LEVEL_INFO,
+        log::Level::Debug => LOG_LEVEL_DEBUG,
+        log::Level::Trace => LOG_LEVEL_TRACE,
     }
-    #[cfg(not(debug_assertions))]
-    {
-        false
+}
+
+const fn decode_log_level(level: u8) -> log::Level {
+    match level {
+        LOG_LEVEL_ERROR => log::Level::Error,
+        LOG_LEVEL_WARN => log::Level::Warn,
+        LOG_LEVEL_INFO => log::Level::Info,
+        LOG_LEVEL_TRACE => log::Level::Trace,
+        _ => log::Level::Debug,
     }
+}
+
+pub(crate) fn set_metadata_log_level(level: log::Level) {
+    METADATA_LOG_LEVEL.store(encode_log_level(level), Ordering::Relaxed);
+}
+
+fn metadata_log_level() -> log::Level {
+    decode_log_level(METADATA_LOG_LEVEL.load(Ordering::Relaxed))
+}
+
+fn emit_metadata_debug(args: fmt::Arguments<'_>) {
+    log::log!(
+        target: "starmine_ad::eac3dec::metadata",
+        metadata_log_level(),
+        "{args}"
+    );
 }
 
 fn parse_oamd_payload(reader: &mut BitReader<'_>) -> Result<OamdPayload, ParseError> {
@@ -440,13 +475,11 @@ fn parse_oamd_payload(reader: &mut BitReader<'_>) -> Result<OamdPayload, ParseEr
             .ok_or(ParseError::UnsupportedFeature("ISF"))?;
     }
 
-    if debug_metadata_enabled() {
-        eprintln!(
-            "oamd version={version} obj={object_count} beds={beds} bedinst={} bed_or_isf={bed_or_isf_objects} alt={} elem={element_count}",
-            bed_assignment.len(),
-            alternate_object_present as u8,
-        );
-    }
+    emit_metadata_debug(format_args!(
+        "oamd version={version} obj={object_count} beds={beds} bedinst={} bed_or_isf={bed_or_isf_objects} alt={} elem={element_count}",
+        bed_assignment.len(),
+        alternate_object_present as u8,
+    ));
 
     let mut elements = Vec::with_capacity(element_count);
     for _ in 0..element_count {
@@ -567,12 +600,10 @@ fn parse_oamd_element(
         .position()
         .checked_add(byte_length * 8)
         .ok_or(ParseError::InvalidHeader("oa_element_length"))?;
-    if debug_metadata_enabled() {
-        eprintln!(
-            "oamd-element start={start_pos} idx={element_index} len={}B payload_start={payload_start} end={end_pos} alt={}",
-            byte_length, alternate_object_present as u8,
-        );
-    }
+    emit_metadata_debug(format_args!(
+        "oamd-element start={start_pos} idx={element_index} len={}B payload_start={payload_start} end={end_pos} alt={}",
+        byte_length, alternate_object_present as u8,
+    ));
     let skip = if alternate_object_present { 5 } else { 1 };
     skip_bits(reader, skip, "oa_alternate_object_info")?;
 
@@ -587,12 +618,10 @@ fn parse_oamd_element(
     };
 
     if reader.position() > end_pos {
-        if debug_metadata_enabled() {
-            eprintln!(
-                "oamd-element overrun idx={element_index} pos={} end={end_pos}",
-                reader.position(),
-            );
-        }
+        emit_metadata_debug(format_args!(
+            "oamd-element overrun idx={element_index} pos={} end={end_pos}",
+            reader.position(),
+        ));
         return Err(ParseError::InvalidHeader("oa_element_length"));
     }
     if reader.position() < end_pos {
@@ -612,12 +641,10 @@ fn parse_oamd_object_element(
     bed_or_isf_objects: usize,
 ) -> Result<OamdObjectElement, ParseError> {
     let (sample_offset, block_updates) = parse_md_update_info(reader)?;
-    if debug_metadata_enabled() {
-        eprintln!(
-            "oamd-object-element sample_offset={sample_offset} blocks={} objects={object_count} bed_or_isf={bed_or_isf_objects}",
-            block_updates.len(),
-        );
-    }
+    emit_metadata_debug(format_args!(
+        "oamd-object-element sample_offset={sample_offset} blocks={} objects={object_count} bed_or_isf={bed_or_isf_objects}",
+        block_updates.len(),
+    ));
     if !read_bit(reader, "oa_reserved_flag")? {
         skip_bits(reader, 5, "oa_reserved_bits")?;
     }
@@ -671,12 +698,10 @@ fn parse_md_update_info(
             ramp_duration,
         });
     }
-    if debug_metadata_enabled() {
-        eprintln!(
-            "oamd-update-info sample_offset={} blocks={:?}",
-            sample_offset, updates
-        );
-    }
+    emit_metadata_debug(format_args!(
+        "oamd-update-info sample_offset={} blocks={:?}",
+        sample_offset, updates
+    ));
     Ok((sample_offset, updates))
 }
 
@@ -831,17 +856,15 @@ fn parse_oamd_object_block(
         anchor = ObjectAnchor::Speaker;
     }
 
-    if debug_metadata_enabled() {
-        eprintln!(
-            "oamd-object-block obj={object_index} blk={block_index} start={start_pos} end={} inactive={} basic_status={} basic_blocks={basic_info_blocks:?} gain={gain:?} render_status={} render_blocks={render_info_blocks:?} anchor={anchor:?} valid_pos={} diff={} pos={position:?} dist={distance:?} size={size:?} screen={screen_factor:?}/{depth_factor:?} addtl={additional_data_bytes}",
-            reader.position(),
-            inactive as u8,
-            basic_info_status,
-            render_info_status,
-            valid_position as u8,
-            differential_position as u8,
-        );
-    }
+    emit_metadata_debug(format_args!(
+        "oamd-object-block obj={object_index} blk={block_index} start={start_pos} end={} inactive={} basic_status={} basic_blocks={basic_info_blocks:?} gain={gain:?} render_status={} render_blocks={render_info_blocks:?} anchor={anchor:?} valid_pos={} diff={} pos={position:?} dist={distance:?} size={size:?} screen={screen_factor:?}/{depth_factor:?} addtl={additional_data_bytes}",
+        reader.position(),
+        inactive as u8,
+        basic_info_status,
+        render_info_status,
+        valid_position as u8,
+        differential_position as u8,
+    ));
 
     Ok(OamdObjectBlock {
         inactive,
@@ -884,30 +907,26 @@ fn parse_joc_payload(reader: &mut BitReader<'_>) -> Result<JocPayload, ParseErro
     let gain = 1.0 + gain_fraction * 2f32.powi(gain_power - 4);
     let sequence_counter = read_bits(reader, 10, "joc_sequence_counter")? as u16;
 
-    if debug_metadata_enabled() {
-        eprintln!(
-            "joc-header dmx={} channels={} objects={} gain={:.3} seq={} bits={}",
-            downmix_config,
-            channel_count,
-            object_count,
-            gain,
-            sequence_counter,
-            reader.position(),
-        );
-    }
+    emit_metadata_debug(format_args!(
+        "joc-header dmx={} channels={} objects={} gain={:.3} seq={} bits={}",
+        downmix_config,
+        channel_count,
+        object_count,
+        gain,
+        sequence_counter,
+        reader.position(),
+    ));
 
     let mut objects = Vec::with_capacity(object_count);
     for object_index in 0..object_count {
         if !reader.bits_left(1) {
             // Some streams omit trailing inactive objects at the exact end of the payload.
             // Keep hard errors for partial object headers/data, but tolerate this tail case.
-            if debug_metadata_enabled() {
-                eprintln!(
-                    "joc-object idx={object_index} truncated-tail bits={} remaining={} -> implicit-inactive",
-                    reader.position(),
-                    object_count - object_index,
-                );
-            }
+            emit_metadata_debug(format_args!(
+                "joc-object idx={object_index} truncated-tail bits={} remaining={} -> implicit-inactive",
+                reader.position(),
+                object_count - object_index,
+            ));
             for _ in object_index..object_count {
                 objects.push(JocObject {
                     active: false,
@@ -923,20 +942,16 @@ fn parse_joc_payload(reader: &mut BitReader<'_>) -> Result<JocPayload, ParseErro
             }
             break;
         }
-        if debug_metadata_enabled() {
-            eprintln!(
-                "joc-object idx={object_index} start_bits={}",
-                reader.position()
-            );
-        }
+        emit_metadata_debug(format_args!(
+            "joc-object idx={object_index} start_bits={}",
+            reader.position()
+        ));
         let active = read_bit(reader, "b_joc_obj_present")?;
         if !active {
-            if debug_metadata_enabled() {
-                eprintln!(
-                    "joc-object idx={object_index} inactive end_bits={}",
-                    reader.position()
-                );
-            }
+            emit_metadata_debug(format_args!(
+                "joc-object idx={object_index} inactive end_bits={}",
+                reader.position()
+            ));
             objects.push(JocObject {
                 active,
                 bands_index: None,
@@ -968,19 +983,17 @@ fn parse_joc_payload(reader: &mut BitReader<'_>) -> Result<JocPayload, ParseErro
             }
         }
 
-        if debug_metadata_enabled() {
-            eprintln!(
-                "joc-object idx={object_index} active bands_idx={} bands={} sparse={} quant={} steep={} points={} offsets={:?} header_end_bits={}",
-                bands_index,
-                bands,
-                sparse_coded as u8,
-                quantization_table,
-                steep_slope as u8,
-                data_points,
-                timeslot_offsets,
-                reader.position(),
-            );
-        }
+        emit_metadata_debug(format_args!(
+            "joc-object idx={object_index} active bands_idx={} bands={} sparse={} quant={} steep={} points={} offsets={:?} header_end_bits={}",
+            bands_index,
+            bands,
+            sparse_coded as u8,
+            quantization_table,
+            steep_slope as u8,
+            data_points,
+            timeslot_offsets,
+            reader.position(),
+        ));
 
         objects.push(JocObject {
             active,
@@ -1026,20 +1039,18 @@ fn parse_joc_payload(reader: &mut BitReader<'_>) -> Result<JocPayload, ParseErro
                 channel_indices.push(channels);
                 vectors.push(data_vector);
             }
-            if debug_metadata_enabled() {
-                eprintln!(
-                    "joc-object idx={object_index} sparse-data preview_channels={:?} preview_vectors={:?} end_bits={}",
-                    channel_indices
-                        .first()
-                        .map(|channels| &channels[..channels.len().min(12)])
-                        .unwrap_or(&[]),
-                    vectors
-                        .first()
-                        .map(|vector| &vector[..vector.len().min(12)])
-                        .unwrap_or(&[]),
-                    reader.position(),
-                );
-            }
+            emit_metadata_debug(format_args!(
+                "joc-object idx={object_index} sparse-data preview_channels={:?} preview_vectors={:?} end_bits={}",
+                channel_indices
+                    .first()
+                    .map(|channels| &channels[..channels.len().min(12)])
+                    .unwrap_or(&[]),
+                vectors
+                    .first()
+                    .map(|vector| &vector[..vector.len().min(12)])
+                    .unwrap_or(&[]),
+                reader.position(),
+            ));
             Some(JocObjectData::Sparse {
                 channel_indices,
                 vectors,
@@ -1058,17 +1069,15 @@ fn parse_joc_payload(reader: &mut BitReader<'_>) -> Result<JocPayload, ParseErro
                 }
                 matrices.push(data_point);
             }
-            if debug_metadata_enabled() {
-                eprintln!(
-                    "joc-object idx={object_index} dense-data preview={:?} end_bits={}",
-                    matrices
-                        .first()
-                        .and_then(|data_point| data_point.first())
-                        .map(|channel| &channel[..channel.len().min(12)])
-                        .unwrap_or(&[]),
-                    reader.position(),
-                );
-            }
+            emit_metadata_debug(format_args!(
+                "joc-object idx={object_index} dense-data preview={:?} end_bits={}",
+                matrices
+                    .first()
+                    .and_then(|data_point| data_point.first())
+                    .map(|channel| &channel[..channel.len().min(12)])
+                    .unwrap_or(&[]),
+                reader.position(),
+            ));
             Some(JocObjectData::Dense { matrices })
         };
     }
@@ -1180,16 +1189,18 @@ fn read_variable_bits_limited(
             .checked_add(part)
             .ok_or(ParseError::InvalidHeader(field))?;
         let read_more = read_bit(reader, field)?;
-        if debug_metadata_enabled() && field == "oa_element_length" {
-            eprintln!(
+        if field == "oa_element_length" {
+            emit_metadata_debug(format_args!(
                 "varbits field={field} group={} part={part} more={}",
                 groups.len() - 1,
                 read_more as u8,
-            );
+            ));
         }
         if !read_more {
-            if debug_metadata_enabled() && field == "oa_element_length" {
-                eprintln!("varbits field={field} value={value} groups={groups:?}");
+            if field == "oa_element_length" {
+                emit_metadata_debug(format_args!(
+                    "varbits field={field} value={value} groups={groups:?}"
+                ));
             }
             return Ok(value);
         }
@@ -1198,8 +1209,10 @@ fn read_variable_bits_limited(
             .and_then(|next| next.checked_shl(width as u32))
             .ok_or(ParseError::InvalidHeader(field))?;
         if limit == 0 {
-            if debug_metadata_enabled() && field == "oa_element_length" {
-                eprintln!("varbits field={field} value={value} groups={groups:?} limit-hit");
+            if field == "oa_element_length" {
+                emit_metadata_debug(format_args!(
+                    "varbits field={field} value={value} groups={groups:?} limit-hit"
+                ));
             }
             return Ok(value);
         }

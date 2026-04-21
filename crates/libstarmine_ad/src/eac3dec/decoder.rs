@@ -11,7 +11,7 @@ pub struct PushResult {
     pub info: AccessUnitInfo,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 /// Stateful access-unit inspector.
 ///
 /// Use this type when you want frame validation and metadata extraction but do not need decoded
@@ -20,6 +20,17 @@ pub struct PushResult {
 pub struct Decoder {
     frames_seen: u64,
     metadata_state: MetadataParseState,
+    debug_log_level: log::Level,
+}
+
+impl Default for Decoder {
+    fn default() -> Self {
+        Self {
+            frames_seen: 0,
+            metadata_state: MetadataParseState::default(),
+            debug_log_level: log::Level::Debug,
+        }
+    }
 }
 
 impl Decoder {
@@ -41,11 +52,22 @@ impl Decoder {
         self.frames_seen
     }
 
+    /// Configure the metadata / aux diagnostic log level for this decoder instance.
+    pub fn set_debug_log_level(&mut self, level: log::Level) {
+        self.debug_log_level = level;
+    }
+
+    fn apply_debug_log_level(&self) {
+        super::metadata::set_metadata_log_level(self.debug_log_level);
+        super::syncframe::set_aux_log_level(self.debug_log_level);
+    }
+
     /// Parse one complete E-AC-3 access unit.
     ///
     /// The input must contain exactly one frame. Short buffers and trailing bytes are reported as
     /// errors so the caller can keep access-unit boundaries explicit.
     pub fn push_access_unit(&mut self, access_unit: &[u8]) -> Result<PushResult, ParseError> {
+        self.apply_debug_log_level();
         let info = inspect_access_unit_with_metadata_state(access_unit, &mut self.metadata_state)?;
 
         if access_unit.len() < info.frame_size {

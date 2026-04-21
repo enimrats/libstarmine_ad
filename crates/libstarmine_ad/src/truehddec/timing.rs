@@ -3,10 +3,10 @@
 //! Provides timing trait implementations and high-resolution timing
 //! state management for stream synchronization.
 
-use anyhow::Result;
 use log::{debug, trace, warn};
 
-use crate::process::parse::ParserState;
+use crate::truehddec::process::parse::ParserState;
+use crate::truehddec::utils::errors::Result;
 
 /// Trait providing timing information access for audio processing.
 pub trait Timing {

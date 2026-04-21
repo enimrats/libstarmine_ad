@@ -10,7 +10,7 @@ use bitstream_io::{
     BigEndian, BitRead, BitReader, SignedInteger, UnsignedInteger, define_huffman_tree,
 };
 
-use crate::utils::crc::{Crc8, Crc16, crc8, crc16};
+use crate::truehddec::utils::crc::{Crc8, Crc16, crc8, crc16};
 
 const STACK_BUF_SIZE: usize = 256;
 

@@ -6,8 +6,8 @@
 use std::default::Default;
 use std::mem::transmute;
 
-use crate::utils::bitstream_io::BsIoSliceReader;
-use anyhow::Result;
+use crate::truehddec::utils::bitstream_io::BsIoSliceReader;
+use crate::truehddec::utils::errors::Result;
 use log::{trace, warn};
 
 pub const MAX_OBJECT_COUNT: usize = 159;
@@ -1272,10 +1272,10 @@ pub const TEST_DATA_BROKEN: &[u8] = &[
 
 #[cfg(test)]
 mod tests {
-    use crate::structs::oamd::{
+    use crate::truehddec::structs::oamd::{
         ObjectAudioMetadataPayload, TEST_DATA, TEST_DATA_BROKEN, TEST_DATA_TRIM,
     };
-    use anyhow::Result;
+    use crate::truehddec::utils::errors::Result;
 
     #[test]
     fn test1() -> Result<()> {

@@ -18,6 +18,8 @@ use super::metadata::{
 };
 use super::pcm::CorePcmFrame;
 use crate::renderer::BedChannel;
+use std::sync::atomic::{AtomicU8, Ordering};
+use thiserror::Error;
 
 const EAC3_BLOCKS: [u8; 4] = [1, 2, 3, 6];
 const AC3_SAMPLE_RATES: [u32; 3] = [48_000, 44_100, 32_000];
@@ -60,6 +62,46 @@ const FRM_EXP_STRATEGIES: [[u8; 6]; 32] = [
     [3, 3, 3, 3, 2, 0],
     [3, 3, 3, 3, 3, 3],
 ];
+
+const LOG_LEVEL_ERROR: u8 = 1;
+const LOG_LEVEL_WARN: u8 = 2;
+const LOG_LEVEL_INFO: u8 = 3;
+const LOG_LEVEL_DEBUG: u8 = 4;
+const LOG_LEVEL_TRACE: u8 = 5;
+
+static AUX_LOG_LEVEL: AtomicU8 = AtomicU8::new(LOG_LEVEL_DEBUG);
+
+const fn encode_log_level(level: log::Level) -> u8 {
+    match level {
+        log::Level::Error => LOG_LEVEL_ERROR,
+        log::Level::Warn => LOG_LEVEL_WARN,
+        log::Level::Info => LOG_LEVEL_INFO,
+        log::Level::Debug => LOG_LEVEL_DEBUG,
+        log::Level::Trace => LOG_LEVEL_TRACE,
+    }
+}
+
+const fn decode_log_level(level: u8) -> log::Level {
+    match level {
+        LOG_LEVEL_ERROR => log::Level::Error,
+        LOG_LEVEL_WARN => log::Level::Warn,
+        LOG_LEVEL_INFO => log::Level::Info,
+        LOG_LEVEL_TRACE => log::Level::Trace,
+        _ => log::Level::Debug,
+    }
+}
+
+pub(crate) fn set_aux_log_level(level: log::Level) {
+    AUX_LOG_LEVEL.store(encode_log_level(level), Ordering::Relaxed);
+}
+
+fn aux_log_level() -> log::Level {
+    decode_log_level(AUX_LOG_LEVEL.load(Ordering::Relaxed))
+}
+
+fn emit_aux_debug(args: fmt::Arguments<'_>) {
+    log::log!(target: "starmine_ad::eac3dec::aux", aux_log_level(), "{args}");
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// E-AC-3 frame coding mode.
@@ -150,43 +192,24 @@ impl ExpStrategy {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 /// Parse errors returned by the low-level access-unit inspection and decode helpers.
 pub enum ParseError {
+    #[error("short-packet")]
     ShortPacket,
+    #[error("bad-syncword")]
     BadSyncword,
+    #[error("not-eac3")]
     NotEac3,
+    #[error("invalid-header:{0}")]
     InvalidHeader(&'static str),
+    #[error("unsupported-feature:{0}")]
     UnsupportedFeature(&'static str),
+    #[error("truncated-frame expected={expected} available={available}")]
     TruncatedFrame { expected: usize, available: usize },
+    #[error("trailing-data expected={expected} provided={provided}")]
     TrailingData { expected: usize, provided: usize },
 }
-
-impl fmt::Display for ParseError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ParseError::ShortPacket => f.write_str("short-packet"),
-            ParseError::BadSyncword => f.write_str("bad-syncword"),
-            ParseError::NotEac3 => f.write_str("not-eac3"),
-            ParseError::InvalidHeader(field) => write!(f, "invalid-header:{field}"),
-            ParseError::UnsupportedFeature(feature) => write!(f, "unsupported-feature:{feature}"),
-            ParseError::TruncatedFrame {
-                expected,
-                available,
-            } => {
-                write!(
-                    f,
-                    "truncated-frame expected={expected} available={available}"
-                )
-            }
-            ParseError::TrailingData { expected, provided } => {
-                write!(f, "trailing-data expected={expected} provided={provided}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for ParseError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// Lightweight description of one EMDF payload inside an access unit.
@@ -790,9 +813,9 @@ pub(crate) fn inspect_access_unit_with_metadata_state(
                     aux_parse_status = AuxParseStatus::Extracted;
                 }
                 Err(err @ ParseError::UnsupportedFeature(_)) => {
-                    if debug_aux_enabled() {
-                        eprintln!("no-blkstart frame sequential parse error: {err}");
-                    }
+                    emit_aux_debug(format_args!(
+                        "no-blkstart frame sequential parse error: {err}"
+                    ));
                     // TODO: Delete this EMDF-anchored fallback once no-blkstrtinfo walking
                     // covers coupling/SPX and other remaining unsupported syntaxes.
                     if let Some(recovered_fields) = recover_skip_fields_from_emdf_markers(frame) {
@@ -807,9 +830,9 @@ pub(crate) fn inspect_access_unit_with_metadata_state(
                     | ParseError::InvalidHeader("block-end")
                     | ParseError::InvalidHeader("mantissa-range")),
                 ) => {
-                    if debug_aux_enabled() {
-                        eprintln!("no-blkstart frame sequential parse error: {err}");
-                    }
+                    emit_aux_debug(format_args!(
+                        "no-blkstart frame sequential parse error: {err}"
+                    ));
                     if let Some(recovered_fields) = recover_skip_fields_from_emdf_markers(frame) {
                         skip_fields = recovered_fields;
                         aux_parse_status = AuxParseStatus::SyncAnchoredRecovery;
@@ -1329,35 +1352,31 @@ fn collect_skip_fields_without_block_start(
         )? {
             skip_fields.push(skip_field);
         }
-        if debug_aux_enabled() {
-            let skip_len = skip_fields
-                .last()
-                .filter(|field| field.block_index == Some(block))
-                .map(|field| field.bytes.len())
-                .unwrap_or(0);
-            eprintln!(
-                "no-blkstart block={block} pos={} skip={}B",
-                reader.position(),
-                skip_len,
-            );
-        }
+        let skip_len = skip_fields
+            .last()
+            .filter(|field| field.block_index == Some(block))
+            .map(|field| field.bytes.len())
+            .unwrap_or(0);
+        emit_aux_debug(format_args!(
+            "no-blkstart block={block} pos={} skip={}B",
+            reader.position(),
+            skip_len,
+        ));
     }
 
     if reader.position() > audio_payload_end_bit {
-        if debug_aux_enabled() {
-            eprintln!(
-                "no-blkstart end mismatch pos={} expected={audio_payload_end_bit}",
-                reader.position(),
-            );
-        }
+        emit_aux_debug(format_args!(
+            "no-blkstart end mismatch pos={} expected={audio_payload_end_bit}",
+            reader.position(),
+        ));
         return Err(ParseError::InvalidHeader("block-end"));
     }
 
-    if debug_aux_enabled() && reader.position() < audio_payload_end_bit {
-        eprintln!(
+    if reader.position() < audio_payload_end_bit {
+        emit_aux_debug(format_args!(
             "no-blkstart trailing-tail pos={} expected={audio_payload_end_bit}",
             reader.position(),
-        );
+        ));
     }
     // Existing decoder implementations decode the declared blocks and then read the syncframe
     // tail from the back without asserting an exact forward reader end position. Keep that tail
@@ -1506,27 +1525,25 @@ fn parse_block(
     if consume_mantissas {
         consume_block_mantissas(reader, block, lfe_on, audio_frame, state, &allocation)?;
     }
-    if debug_aux_enabled() {
-        let skip_bits = skip_field
-            .as_ref()
-            .map(|field| 10 + field.bytes.len() * 8)
-            .unwrap_or(0);
-        eprintln!(
-            "block={block} parse start={block_start} syntax_end={syntax_end} end={} syntax_bits={} skip_bits={skip_bits} spx={} spxbegf={} spx_begin_sbnd={} chbwcod={:?} chexp={:?} lfeexp={}",
-            reader.position(),
-            syntax_end - block_start,
-            state.spx_in_use as u8,
-            state.spxbegf,
-            state.spx_begin_subbnd,
-            state.chbwcod,
-            audio_frame.channel_exponent_strategy[block],
-            audio_frame
-                .lfe_exponent_strategy
-                .get(block)
-                .copied()
-                .unwrap_or(false) as u8,
-        );
-    }
+    let skip_bits = skip_field
+        .as_ref()
+        .map(|field| 10 + field.bytes.len() * 8)
+        .unwrap_or(0);
+    emit_aux_debug(format_args!(
+        "block={block} parse start={block_start} syntax_end={syntax_end} end={} syntax_bits={} skip_bits={skip_bits} spx={} spxbegf={} spx_begin_sbnd={} chbwcod={:?} chexp={:?} lfeexp={}",
+        reader.position(),
+        syntax_end - block_start,
+        state.spx_in_use as u8,
+        state.spxbegf,
+        state.spx_begin_subbnd,
+        state.chbwcod,
+        audio_frame.channel_exponent_strategy[block],
+        audio_frame
+            .lfe_exponent_strategy
+            .get(block)
+            .copied()
+            .unwrap_or(false) as u8,
+    ));
 
     Ok(skip_field)
 }
@@ -2038,14 +2055,12 @@ fn consume_block_mantissas(
             &mut mantissa_groups,
         );
         total_mantissa_bits += mantissa_bits;
-        if debug_aux_enabled() {
-            eprintln!(
-                "block={block} ch={channel} endmant={end_mantissa} csnr={} fsnr={} fgain={} mantissa_bits={mantissa_bits}",
-                state.csnr_offset,
-                state.channel_fsnr_offsets[channel],
-                state.channel_fgain_codes[channel],
-            );
-        }
+        emit_aux_debug(format_args!(
+            "block={block} ch={channel} endmant={end_mantissa} csnr={} fsnr={} fgain={} mantissa_bits={mantissa_bits}",
+            state.csnr_offset,
+            state.channel_fsnr_offsets[channel],
+            state.channel_fgain_codes[channel],
+        ));
         reader
             .skip_bits(mantissa_bits)
             .ok_or(ParseError::ShortPacket)?;
@@ -2072,24 +2087,19 @@ fn consume_block_mantissas(
             let mantissa_bits =
                 lfe_allocation.count_mantissa_bits(0, LFE_END_MANTISSA, &mut mantissa_groups);
             total_mantissa_bits += mantissa_bits;
-            if debug_aux_enabled() {
-                eprintln!(
-                    "block={block} lfe endmant={} csnr={} fsnr={} fgain={} mantissa_bits={mantissa_bits}",
-                    LFE_END_MANTISSA,
-                    state.csnr_offset,
-                    state.lfe_fsnr_offset,
-                    state.lfe_fgain_code,
-                );
-            }
+            emit_aux_debug(format_args!(
+                "block={block} lfe endmant={} csnr={} fsnr={} fgain={} mantissa_bits={mantissa_bits}",
+                LFE_END_MANTISSA, state.csnr_offset, state.lfe_fsnr_offset, state.lfe_fgain_code,
+            ));
             reader
                 .skip_bits(mantissa_bits)
                 .ok_or(ParseError::ShortPacket)?;
         }
     }
 
-    if debug_aux_enabled() {
-        eprintln!("block={block} total_mantissa_bits={total_mantissa_bits}");
-    }
+    emit_aux_debug(format_args!(
+        "block={block} total_mantissa_bits={total_mantissa_bits}"
+    ));
 
     Ok(())
 }
@@ -2612,17 +2622,6 @@ fn log2_ceil(value: usize) -> usize {
         0
     } else {
         usize::BITS as usize - (value - 1).leading_zeros() as usize
-    }
-}
-
-fn debug_aux_enabled() -> bool {
-    #[cfg(debug_assertions)]
-    {
-        std::env::var_os("STARMINE_AD_DEBUG_AUX").is_some()
-    }
-    #[cfg(not(debug_assertions))]
-    {
-        false
     }
 }
 

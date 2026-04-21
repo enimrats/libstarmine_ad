@@ -1,15 +1,12 @@
-use anyhow::{Result, bail};
-
-use crate::process::extract::Frame;
-use crate::process::{MAX_PRESENTATIONS, PresentationMap};
-use crate::structs::access_unit::AccessUnit;
-use crate::structs::restart_header::Guards;
-use crate::utils::bitstream_io::BsIoSliceReader;
-use crate::utils::crc::{
+use crate::truehddec::process::{MAX_PRESENTATIONS, PresentationMap};
+use crate::truehddec::structs::access_unit::AccessUnit;
+use crate::truehddec::structs::restart_header::Guards;
+use crate::truehddec::utils::bitstream_io::BsIoSliceReader;
+use crate::truehddec::utils::crc::{
     CRC_MAJOR_SYNC_INFO_ALG, CRC_RESTART_BLOCK_HEADER_ALG, CRC_SUBSTREAM_ALG, Crc8, Crc16,
 };
-use crate::utils::errors::ParseError;
-use crate::utils::timing::HiresOutputTimingState;
+use crate::truehddec::utils::errors::{ParseError, Result};
+use crate::truehddec::utils::timing::HiresOutputTimingState;
 
 /// Parses audio frames into structured access units.
 ///
@@ -26,8 +23,8 @@ impl Parser {
     /// Returns an [`AccessUnit`] containing parsed metadata, audio blocks,
     /// and timing information. Handles both major sync frames (with stream
     /// configuration) and continuation frames (audio data only).
-    pub fn parse(&mut self, frame: &Frame) -> Result<AccessUnit> {
-        let reader = &mut BsIoSliceReader::from_slice(frame.as_ref());
+    pub fn parse(&mut self, access_unit: &[u8]) -> Result<AccessUnit> {
+        let reader = &mut BsIoSliceReader::from_slice(access_unit);
         AccessUnit::read(&mut self.state, reader)
     }
 
@@ -398,11 +395,11 @@ impl ParserState {
 
     fn check_substream(&self, i: usize) -> Result<()> {
         let Some(substreams) = self.substreams else {
-            bail!(ParseError::NoSubstream);
+            return Err((ParseError::NoSubstream).into());
         };
 
         if substreams <= i {
-            bail!(ParseError::InvalidSubstreamIndex(i + 1, substreams));
+            return Err((ParseError::InvalidSubstreamIndex(i + 1, substreams)).into());
         }
 
         Ok(())

@@ -71,7 +71,7 @@ pub struct ObjectPcmPushResult {
     pub pcm: ObjectPcmFrame,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 /// Stateful decoder for the core channel PCM path.
 ///
 /// This decoder keeps both bitstream syntax state and cross-frame metadata state, so callers must
@@ -80,6 +80,18 @@ pub struct PcmDecoder {
     frames_seen: u64,
     core_state: CoreDecodeState,
     metadata_state: MetadataParseState,
+    debug_log_level: log::Level,
+}
+
+impl Default for PcmDecoder {
+    fn default() -> Self {
+        Self {
+            frames_seen: 0,
+            core_state: CoreDecodeState::default(),
+            metadata_state: MetadataParseState::default(),
+            debug_log_level: log::Level::Debug,
+        }
+    }
 }
 
 impl PcmDecoder {
@@ -100,8 +112,19 @@ impl PcmDecoder {
         self.frames_seen
     }
 
+    /// Configure the metadata / aux diagnostic log level for this decoder instance.
+    pub fn set_debug_log_level(&mut self, level: log::Level) {
+        self.debug_log_level = level;
+    }
+
+    fn apply_debug_log_level(&self) {
+        super::metadata::set_metadata_log_level(self.debug_log_level);
+        super::syncframe::set_aux_log_level(self.debug_log_level);
+    }
+
     /// Decode one complete access unit into core PCM.
     pub fn push_access_unit(&mut self, access_unit: &[u8]) -> Result<PcmPushResult, ParseError> {
+        self.apply_debug_log_level();
         let info = inspect_access_unit_with_metadata_state(access_unit, &mut self.metadata_state)?;
 
         if access_unit.len() < info.frame_size {
@@ -127,7 +150,7 @@ impl PcmDecoder {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 /// Stateful decoder for dynamic object PCM.
 ///
 /// This is the highest-level decoder before rendering. It returns `Ok(None)` for frames that do
@@ -137,6 +160,19 @@ pub struct ObjectPcmDecoder {
     core_state: CoreDecodeState,
     joc_state: JocObjectDecoderState,
     metadata_state: MetadataParseState,
+    debug_log_level: log::Level,
+}
+
+impl Default for ObjectPcmDecoder {
+    fn default() -> Self {
+        Self {
+            frames_seen: 0,
+            core_state: CoreDecodeState::default(),
+            joc_state: JocObjectDecoderState::default(),
+            metadata_state: MetadataParseState::default(),
+            debug_log_level: log::Level::Debug,
+        }
+    }
 }
 
 impl ObjectPcmDecoder {
@@ -165,6 +201,16 @@ impl ObjectPcmDecoder {
         self.joc_state.last_frame_matrices()
     }
 
+    /// Configure the metadata / aux diagnostic log level for this decoder instance.
+    pub fn set_debug_log_level(&mut self, level: log::Level) {
+        self.debug_log_level = level;
+    }
+
+    fn apply_debug_log_level(&self) {
+        super::metadata::set_metadata_log_level(self.debug_log_level);
+        super::syncframe::set_aux_log_level(self.debug_log_level);
+    }
+
     /// Decode one complete access unit into dynamic object PCM.
     ///
     /// Returns `Ok(None)` when the frame is valid E-AC-3 but does not contain the object payloads
@@ -173,6 +219,7 @@ impl ObjectPcmDecoder {
         &mut self,
         access_unit: &[u8],
     ) -> Result<Option<ObjectPcmPushResult>, ParseError> {
+        self.apply_debug_log_level();
         let info = inspect_access_unit_with_metadata_state(access_unit, &mut self.metadata_state)?;
 
         if access_unit.len() < info.frame_size {

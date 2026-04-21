@@ -1,15 +1,17 @@
-#[macro_export]
+use std::io;
+
 macro_rules! log_or_err {
     ($state:expr, $level:expr, $err:expr $(,)?) => {{
+        let err: $crate::truehddec::utils::errors::TrueHdInternalError = $err.into();
         if $level <= $state.fail_level {
-            return Err($err);
+            return Err(err);
         } else {
             match $level {
-                ::log::Level::Error => ::log::error!("{}", $err),
-                ::log::Level::Warn => ::log::warn!("{}", $err),
-                ::log::Level::Info => ::log::info!("{}", $err),
-                ::log::Level::Debug => ::log::debug!("{}", $err),
-                ::log::Level::Trace => ::log::trace!("{}", $err),
+                ::log::Level::Error => ::log::error!("{}", err),
+                ::log::Level::Warn => ::log::warn!("{}", err),
+                ::log::Level::Info => ::log::info!("{}", err),
+                ::log::Level::Debug => ::log::debug!("{}", err),
+                ::log::Level::Trace => ::log::trace!("{}", err),
             }
         }
     }};
@@ -31,21 +33,12 @@ pub enum DecodeError {
 
     #[error("Invalid presentation index: {0}")]
     InvalidPresentation(usize),
-}
 
-#[derive(thiserror::Error, Debug)]
-pub enum ExtractError {
-    #[error("Mismatch in substream count: found {found}, expected {expected}")]
-    SubstreamMismatch { found: usize, expected: usize },
+    #[error("Presentation map not initialized")]
+    PresentationMapNotInitialized,
 
-    #[error("Parity check failed for frame")]
-    ParityCheckFailed,
-
-    #[error("Insufficient buffer data for frame extraction")]
-    InsufficientData,
-
-    #[error("Invalid sync pattern detected")]
-    InvalidSyncPattern,
+    #[error("No presentation is available")]
+    NoPresentationAvailable,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -172,6 +165,9 @@ pub enum ChannelError {
 
     #[error("huff_lsbs[{chan}] must be ≤ {max}, got {actual}")]
     HuffLsbsTooLarge { chan: usize, max: u32, actual: u32 },
+
+    #[error("Invalid channel group modifier: {0}")]
+    InvalidChannelGroupModifier(u8),
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -442,10 +438,42 @@ pub enum SyncError {
 }
 
 #[derive(thiserror::Error, Debug)]
-pub enum TimestampError {
-    #[error("Invalid Timestamp sync bytes")]
-    InvalidSyncBytes,
+pub enum TrueHdInternalError {
+    #[error(transparent)]
+    Io(#[from] io::Error),
 
-    #[error("parse_bcd16: Invalid BCD digit")]
-    InvalidBcdDigit,
+    #[error(transparent)]
+    Decode(#[from] DecodeError),
+
+    #[error(transparent)]
+    Parse(#[from] ParseError),
+
+    #[error(transparent)]
+    AccessUnit(#[from] AccessUnitError),
+
+    #[error(transparent)]
+    Block(#[from] BlockError),
+
+    #[error(transparent)]
+    Channel(#[from] ChannelError),
+
+    #[error(transparent)]
+    ExtraData(#[from] ExtraDataError),
+
+    #[error(transparent)]
+    Filter(#[from] FilterError),
+
+    #[error(transparent)]
+    Matrix(#[from] MatrixError),
+
+    #[error(transparent)]
+    RestartHeader(#[from] RestartHeaderError),
+
+    #[error(transparent)]
+    Substream(#[from] SubstreamError),
+
+    #[error(transparent)]
+    Sync(#[from] SyncError),
 }
+
+pub type Result<T> = std::result::Result<T, TrueHdInternalError>;

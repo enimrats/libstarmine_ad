@@ -3,12 +3,6 @@
 version = 4
 
 [[package]]
-name = "anyhow"
-version = "1.0.102"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
-
-[[package]]
 name = "autocfg"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -27,8 +21,10 @@ dependencies = [
 name = "libstarmine_ad"
 version = "0.1.0"
 dependencies = [
+ "bitstream-io",
+ "log",
  "rustfft",
- "truehd",
+ "thiserror",
 ]
 
 [[package]]
@@ -165,16 +161,6 @@ checksum = "1ad61aed86bc3faea4300c7aee358b4c6d0c8d6ccc36524c96e4c92ccf26e77e"
 dependencies = [
  "num-integer",
  "strength_reduce",
-]
-
-[[package]]
-name = "truehd"
-version = "0.4.0"
-dependencies = [
- "anyhow",
- "bitstream-io",
- "log",
- "thiserror",
 ]
 
 [[package]]

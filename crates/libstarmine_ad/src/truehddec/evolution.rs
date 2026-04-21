@@ -3,9 +3,8 @@
 //! This module contains structures for handling Evolution frames,
 //! which provide metadata and protection features.
 
-use anyhow::Result;
-
-use crate::utils::bitstream_io::BsIoSliceReader;
+use crate::truehddec::utils::bitstream_io::BsIoSliceReader;
+use crate::truehddec::utils::errors::Result;
 
 /// Configuration for Evolution payload data
 #[derive(Debug, Default)]

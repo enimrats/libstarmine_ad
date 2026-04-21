@@ -10,18 +10,16 @@
 //! - **Compressed data**: Huffman-encoded audio samples
 //! - **Error protection**: Optional CRC and length validation
 
-use anyhow::{Result, anyhow, bail};
 use log::Level::Warn;
 use log::{info, trace, warn};
 
-use crate::log_or_err;
-use crate::process::decode::DecoderState;
-use crate::process::parse::{ParserState, ParserSubstreamState};
-use crate::structs::channel::ChannelParams;
-use crate::structs::matrix::Matrixing;
-use crate::structs::restart_header::{Guards, GuardsField, RestartHeader};
-use crate::utils::bitstream_io::BsIoSliceReader;
-use crate::utils::errors::BlockError;
+use crate::truehddec::process::decode::DecoderState;
+use crate::truehddec::process::parse::{ParserState, ParserSubstreamState};
+use crate::truehddec::structs::channel::ChannelParams;
+use crate::truehddec::structs::matrix::Matrixing;
+use crate::truehddec::structs::restart_header::{Guards, GuardsField, RestartHeader};
+use crate::truehddec::utils::bitstream_io::BsIoSliceReader;
+use crate::truehddec::utils::errors::{BlockError, Result};
 
 /// Block header containing selective parameter updates.
 ///
@@ -86,12 +84,13 @@ impl BlockHeader {
             if reader.get()? {
                 let block_size = reader.get_n::<u16>(9)? as usize;
                 if !(8..=160).contains(&block_size) {
-                    bail!(BlockError::InvalidBlockSizeRange(block_size));
+                    return Err((BlockError::InvalidBlockSizeRange(block_size)).into());
                 } else if block_size > samples_per_au {
-                    bail!(BlockError::BlockSizeExceedsAU {
+                    return Err((BlockError::BlockSizeExceedsAU {
                         max: samples_per_au,
-                        actual: block_size
-                    });
+                        actual: block_size,
+                    })
+                    .into());
                 } else if block_size & 7 != 0 {
                     warn!("Block size {block_size} is not a multiple of 8")
                 }
@@ -116,12 +115,13 @@ impl BlockHeader {
                 for i in 0..=ss_state.max_matrix_chan {
                     let output_shift = reader.get_s(4)?;
                     if output_shift > max_shift {
-                        bail!(BlockError::OutputShiftTooLarge {
+                        return Err((BlockError::OutputShiftTooLarge {
                             index: i,
                             value: output_shift,
                             max: max_shift,
-                            substream: state.substream_index
-                        });
+                            substream: state.substream_index,
+                        })
+                        .into());
                     }
 
                     bh.output_shift[i] = Some(output_shift);
@@ -202,7 +202,7 @@ impl Block {
         b.block_data_bits = if state.substream_state()?.error_protect {
             let block_data_bits = reader.get_n(16)?;
             if block_data_bits > 16000 {
-                bail!(BlockError::BlockDataBitsTooLarge(block_data_bits));
+                return Err((BlockError::BlockDataBitsTooLarge(block_data_bits)).into());
             }
             Some(block_data_bits)
         } else {
@@ -256,7 +256,7 @@ impl Block {
                 log_or_err!(
                     state,
                     Warn,
-                    anyhow!(BlockError::LatencyInconsistent {
+                    (BlockError::LatencyInconsistent {
                         substream: state.substream_index
                     })
                 );
@@ -266,7 +266,7 @@ impl Block {
                 log_or_err!(
                     state,
                     Warn,
-                    anyhow!(BlockError::DurationExceedsLatency {
+                    (BlockError::DurationExceedsLatency {
                         duration: state.fifo_duration,
                         latency
                     })
@@ -279,7 +279,7 @@ impl Block {
                 log_or_err!(
                     state,
                     Warn,
-                    anyhow!(BlockError::LatencyTooHigh {
+                    (BlockError::LatencyTooHigh {
                         latency: prev_latency,
                         samples: samples_per_75ms
                     })
@@ -290,7 +290,7 @@ impl Block {
                 log_or_err!(
                     state,
                     Warn,
-                    anyhow!(BlockError::LatencyTooLow {
+                    (BlockError::LatencyTooLow {
                         latency: prev_latency,
                         au: samples_per_au
                     })
@@ -383,11 +383,12 @@ impl Block {
             .skip(min_chan)
         {
             if lsbs > max_lsbs {
-                bail!(BlockError::HuffLsbsTooLarge {
+                return Err((BlockError::HuffLsbsTooLarge {
                     channel: chi,
                     actual: lsbs as usize,
-                    max: max_lsbs as usize
-                });
+                    max: max_lsbs as usize,
+                })
+                .into());
             }
         }
 
@@ -430,7 +431,7 @@ impl Block {
                 let huff_lsbs = huff_lsbs[chi];
                 let quantiser_step_size = quantiser_step_size[chi];
                 if quantiser_step_size > huff_lsbs {
-                    bail!(BlockError::QuantiserStepTooLarge);
+                    return Err((BlockError::QuantiserStepTooLarge).into());
                 }
 
                 let lsbs_bits = huff_lsbs - quantiser_step_size;
@@ -471,9 +472,9 @@ impl Block {
                     let huff_size = reader.position()? - huff_start_pos;
 
                     if audio_data >= 1 << 23 {
-                        bail!(BlockError::HuffmanPositiveSaturation);
+                        return Err((BlockError::HuffmanPositiveSaturation).into());
                     } else if audio_data < -(1 << 23) {
-                        bail!(BlockError::HuffmanNegativeSaturation);
+                        return Err((BlockError::HuffmanNegativeSaturation).into());
                     }
 
                     if chi == min_chan && huff_size + bypassed_lsb_bits > 32 {
@@ -484,7 +485,7 @@ impl Block {
                     }
 
                     if huff_size > 29 {
-                        bail!(BlockError::HuffmanSampleTooLong);
+                        return Err((BlockError::HuffmanSampleTooLong).into());
                     }
                 }
 
@@ -498,10 +499,11 @@ impl Block {
         if let Some(block_data_bits) = b.block_data_bits {
             let actual_block_data_bits = reader.position()? - block_data_start_pos;
             if actual_block_data_bits != block_data_bits as u64 {
-                bail!(BlockError::BlockDataBitCountMismatch {
+                return Err((BlockError::BlockDataBitCountMismatch {
                     expected: block_data_bits,
                     actual: actual_block_data_bits,
-                });
+                })
+                .into());
             }
         }
 

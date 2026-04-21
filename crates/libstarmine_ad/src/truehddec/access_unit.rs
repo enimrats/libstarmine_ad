@@ -1,17 +1,17 @@
-use anyhow::{Result, anyhow, bail};
 use log::Level::{Error, Warn};
 use log::{trace, warn};
 
-use crate::log_or_err;
-use crate::process::MAX_PRESENTATIONS;
-use crate::process::decode::DecoderState;
-use crate::process::parse::ParserState;
-use crate::structs::channel::ChannelLabel;
-use crate::structs::extra_data::ExtraData;
-use crate::structs::substream::{SubstreamDirectory, SubstreamSegment};
-use crate::structs::sync::{MAJOR_SYNC_FBA, MAJOR_SYNC_FBB, MajorSyncInfo, UNIMPLEMENTED_FBB_MSG};
-use crate::utils::bitstream_io::BsIoSliceReader;
-use crate::utils::errors::AccessUnitError;
+use crate::truehddec::process::MAX_PRESENTATIONS;
+use crate::truehddec::process::decode::DecoderState;
+use crate::truehddec::process::parse::ParserState;
+use crate::truehddec::structs::channel::ChannelLabel;
+use crate::truehddec::structs::extra_data::ExtraData;
+use crate::truehddec::structs::substream::{SubstreamDirectory, SubstreamSegment};
+use crate::truehddec::structs::sync::{
+    MAJOR_SYNC_FBA, MAJOR_SYNC_FBB, MajorSyncInfo, UNIMPLEMENTED_FBB_MSG,
+};
+use crate::truehddec::utils::bitstream_io::BsIoSliceReader;
+use crate::truehddec::utils::errors::{AccessUnitError, Result};
 
 /// A parsed access unit containing structured audio data and metadata.
 ///
@@ -146,7 +146,7 @@ impl AccessUnit {
             // no major sync, update gap check
 
             if !state.has_parsed_au {
-                bail!(AccessUnitError::MissingInitialSync)
+                return Err((AccessUnitError::MissingInitialSync).into());
             }
         }
 
@@ -154,7 +154,7 @@ impl AccessUnit {
 
         // TODO: 32 for FBB
         if state.format_sync == MAJOR_SYNC_FBA && major_sync_interval > 128 {
-            log_or_err!(state, Warn, anyhow!(AccessUnitError::FbaSyncTooFar));
+            log_or_err!(state, Warn, (AccessUnitError::FbaSyncTooFar));
         }
 
         // TODO: restart gap check
@@ -164,7 +164,7 @@ impl AccessUnit {
         let minor_start_pos = reader.position()?;
 
         let Some(substreams) = state.substreams else {
-            bail!(AccessUnitError::NoSubstream)
+            return Err((AccessUnitError::NoSubstream).into());
         };
 
         for i in 0..substreams {
@@ -175,7 +175,7 @@ impl AccessUnit {
         state.has_valid_branch = false;
 
         if reader.position()? & 7 != 0 {
-            bail!(AccessUnitError::MisalignedSync)
+            return Err((AccessUnitError::MisalignedSync).into());
         }
 
         let minor_end_pos = reader.position()?;
@@ -183,7 +183,7 @@ impl AccessUnit {
         parity ^= reader.parity_check_nibble_for_last_n_bits(minor_end_pos - minor_start_pos)?;
 
         if parity != 0xF {
-            bail!(AccessUnitError::NibbleParity(parity));
+            return Err((AccessUnitError::NibbleParity(parity)).into());
         }
 
         state.substream_segment_start_pos = reader.position()?;
@@ -218,7 +218,7 @@ impl AccessUnit {
             log_or_err!(
                 state,
                 Error,
-                anyhow!(AccessUnitError::AccessUnitTooLong(
+                (AccessUnitError::AccessUnitTooLong(
                     reader.position()? as usize,
                     state.expected_au_end_pos()
                 ))
@@ -336,7 +336,7 @@ impl AccessUnit {
                 log_or_err!(
                     state,
                     Warn,
-                    anyhow!(AccessUnitError::TimingTooShort(
+                    (AccessUnitError::TimingTooShort(
                         state.input_timing,
                         state.prev_input_timing,
                         state.samples_per_au >> 2
@@ -345,11 +345,7 @@ impl AccessUnit {
             }
 
             if state.has_valid_branch {
-                log_or_err!(
-                    state,
-                    Warn,
-                    anyhow!(AccessUnitError::TimingTooShortAfterJump)
-                );
+                log_or_err!(state, Warn, (AccessUnitError::TimingTooShortAfterJump));
             }
 
             trace!("input_timing jump: input_timing[n]-input_timing[n-1]<samples_per_au/4");
@@ -358,18 +354,14 @@ impl AccessUnit {
 
         if input_timing_interval < state.prev_fifo_duration {
             if !state.allow_seamless_branch || !state.is_major_sync {
-                log_or_err!(
-                    state,
-                    Warn,
-                    anyhow!(AccessUnitError::TimingShorterThanPrevious)
-                );
+                log_or_err!(state, Warn, (AccessUnitError::TimingShorterThanPrevious));
             }
 
             if state.has_valid_branch {
                 log_or_err!(
                     state,
                     Warn,
-                    anyhow!(AccessUnitError::TimingShorterThanPreviousAfterJump)
+                    (AccessUnitError::TimingShorterThanPreviousAfterJump)
                 );
             }
 
@@ -381,15 +373,11 @@ impl AccessUnit {
             && (state.prev_access_unit_length << 8 > input_timing_interval * state.peak_data_rate)
         {
             if !state.allow_seamless_branch || !state.is_major_sync {
-                log_or_err!(state, Warn, anyhow!(AccessUnitError::DataRateExceeded));
+                log_or_err!(state, Warn, (AccessUnitError::DataRateExceeded));
             }
 
             if state.has_valid_branch {
-                log_or_err!(
-                    state,
-                    Warn,
-                    anyhow!(AccessUnitError::DataRateExceededAfterJump)
-                );
+                log_or_err!(state, Warn, (AccessUnitError::DataRateExceededAfterJump));
             }
 
             trace!("input_timing jump: apparent data_rate exceeds peak_data_rate");
@@ -398,15 +386,11 @@ impl AccessUnit {
 
         if state.has_parsed_au && input_timing_interval > samples_per_75ms as usize {
             if !state.allow_seamless_branch || !state.is_major_sync {
-                log_or_err!(state, Warn, anyhow!(AccessUnitError::TimingTooLong));
+                log_or_err!(state, Warn, (AccessUnitError::TimingTooLong));
             }
 
             if state.has_valid_branch {
-                log_or_err!(
-                    state,
-                    Warn,
-                    anyhow!(AccessUnitError::TimingTooLongAfterJump)
-                );
+                log_or_err!(state, Warn, (AccessUnitError::TimingTooLongAfterJump));
             }
 
             trace!("input_timing jump: input_timing[n]-input_timing[n-1] > samples_per_75ms");
@@ -432,10 +416,7 @@ impl AccessUnit {
                 log_or_err!(
                     state,
                     Warn,
-                    anyhow!(AccessUnitError::FixedRateMismatch(
-                        data_rate_16x,
-                        total_length_16x
-                    ))
+                    (AccessUnitError::FixedRateMismatch(data_rate_16x, total_length_16x))
                 );
             }
         }

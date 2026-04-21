@@ -2,16 +2,15 @@ use crate::renderer::{
     BedChannel, ObjectAnchor, RenderMetadata, RenderMetadataBlockUpdate, RenderMetadataElement,
     RenderMetadataObject, RenderMetadataUpdate, Vec3,
 };
-use std::any::Any;
-use std::fmt;
-use std::sync::Arc;
-use truehd::process::{decode::Decoder, extract::Extractor, parse::Parser};
-use truehd::structs::channel::ChannelLabel;
-use truehd::structs::oamd::{
+use crate::truehddec::process::{decode::Decoder, parse::Parser};
+use crate::truehddec::structs::channel::ChannelLabel;
+use crate::truehddec::structs::oamd::{
     ExtendedObjectElement, GAIN_MINUS_INFINITY, ObjectAudioMetadataPayload, ObjectElement,
     ObjectInfoBlock,
 };
-use truehd::utils::errors::ExtractError;
+use std::any::Any;
+use std::fmt;
+use thiserror::Error;
 
 const PRESENTATION_INDEX_ATMOS: usize = 3;
 const PCM_I24_SCALE: f32 = 1.0 / 8_388_608.0;
@@ -35,7 +34,8 @@ const BED_CHANNELS: [BedChannel; 17] = [
     BedChannel::LowFrequencyEffects2,
 ];
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("truehd-{kind} {message}")]
 pub struct TrueHdError {
     kind: TrueHdErrorKind,
     message: String,
@@ -43,29 +43,38 @@ pub struct TrueHdError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TrueHdErrorKind {
-    Extract,
     Parse,
     Decode,
     UnsupportedLayout,
     InvalidMetadata,
 }
 
-impl TrueHdError {
-    fn extract(error: impl fmt::Display) -> Self {
-        Self {
-            kind: TrueHdErrorKind::Extract,
-            message: error.to_string(),
+impl TrueHdErrorKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            TrueHdErrorKind::Parse => "parse",
+            TrueHdErrorKind::Decode => "decode",
+            TrueHdErrorKind::UnsupportedLayout => "unsupported-layout",
+            TrueHdErrorKind::InvalidMetadata => "invalid-metadata",
         }
     }
+}
 
-    fn parse(error: impl fmt::Display) -> Self {
+impl fmt::Display for TrueHdErrorKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl TrueHdError {
+    pub(crate) fn parse(error: impl fmt::Display) -> Self {
         Self {
             kind: TrueHdErrorKind::Parse,
             message: error.to_string(),
         }
     }
 
-    fn decode(error: impl fmt::Display) -> Self {
+    pub(crate) fn decode(error: impl fmt::Display) -> Self {
         Self {
             kind: TrueHdErrorKind::Decode,
             message: error.to_string(),
@@ -87,23 +96,9 @@ impl TrueHdError {
     }
 
     pub(crate) fn kind_name(&self) -> &'static str {
-        match self.kind {
-            TrueHdErrorKind::Extract => "extract",
-            TrueHdErrorKind::Parse => "parse",
-            TrueHdErrorKind::Decode => "decode",
-            TrueHdErrorKind::UnsupportedLayout => "unsupported-layout",
-            TrueHdErrorKind::InvalidMetadata => "invalid-metadata",
-        }
+        self.kind.as_str()
     }
 }
-
-impl fmt::Display for TrueHdError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "truehd-{} {}", self.kind_name(), self.message)
-    }
-}
-
-impl std::error::Error for TrueHdError {}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ObjectPcmFrame {
@@ -169,6 +164,12 @@ impl ObjectPcmDecoder {
         *self = Self::default();
     }
 
+    /// Configure how strictly parser/decoder validation messages fail.
+    pub fn set_fail_level(&mut self, level: log::Level) {
+        self.parser.set_fail_level(level);
+        self.decoder.set_fail_level(level);
+    }
+
     /// Number of access units accepted since the last reset.
     pub fn access_units_seen(&self) -> u64 {
         self.access_units_seen
@@ -187,14 +188,11 @@ impl ObjectPcmDecoder {
         &mut self,
         access_unit: &[u8],
     ) -> Result<Option<ObjectPcmPushResult>, TrueHdError> {
-        let frame = truehd::process::extract::Frame {
-            timestamp: None,
-            data: Arc::<[u8]>::from(access_unit.to_vec()),
-        };
-        let parsed =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.parser.parse(&frame)))
-                .map_err(|panic| TrueHdError::parse(format!("panic: {}", panic_message(panic))))?
-                .map_err(TrueHdError::parse)?;
+        let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.parser.parse(access_unit)
+        }))
+        .map_err(|panic| TrueHdError::parse(format!("panic: {}", panic_message(panic))))?
+        .map_err(TrueHdError::parse)?;
         let decoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.decoder
                 .decode_presentation(&parsed, PRESENTATION_INDEX_ATMOS)
@@ -273,54 +271,6 @@ impl ObjectPcmDecoder {
         Err(TrueHdError::unsupported_layout(format!(
             "unable to resolve layout for channel_count={channel_count} labels={channel_labels:?}"
         )))
-    }
-}
-
-#[derive(Default)]
-pub struct BitstreamObjectPcmDecoder {
-    extractor: Extractor,
-    object_decoder: ObjectPcmDecoder,
-}
-
-impl BitstreamObjectPcmDecoder {
-    /// Create a fresh bitstream decoder for raw `.mlp` / `.thd` input.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Reset extractor and decode state after a seek or discontinuity.
-    pub fn reset(&mut self) {
-        *self = Self::default();
-    }
-
-    /// Feed additional raw TrueHD bitstream bytes and collect every complete decoded frame.
-    pub fn push_bytes(&mut self, bytes: &[u8]) -> Result<Vec<ObjectPcmPushResult>, TrueHdError> {
-        self.extractor.push_bytes(bytes);
-        let mut out = Vec::new();
-
-        while let Some(frame_result) = self.extractor.next() {
-            match frame_result {
-                Ok(frame) => {
-                    if let Some(result) = self.object_decoder.push_access_unit(frame.as_ref())? {
-                        out.push(result);
-                    }
-                }
-                Err(ExtractError::InsufficientData) => break,
-                Err(error) => return Err(TrueHdError::extract(error)),
-            }
-        }
-
-        Ok(out)
-    }
-
-    /// Number of access units accepted since the last reset.
-    pub fn access_units_seen(&self) -> u64 {
-        self.object_decoder.access_units_seen()
-    }
-
-    /// Number of decoded object frames emitted since the last reset.
-    pub fn frames_seen(&self) -> u64 {
-        self.object_decoder.frames_seen()
     }
 }
 
@@ -631,12 +581,9 @@ fn panic_message(panic: Box<dyn Any + Send>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{BitstreamObjectPcmDecoder, bed_channel_from_label};
-    use crate::renderer::{BedChannel, RenderFrameSource};
-    use std::fs::File;
-    use std::io::Read;
-    use std::path::PathBuf;
-    use truehd::structs::channel::ChannelLabel;
+    use super::bed_channel_from_label;
+    use crate::renderer::BedChannel;
+    use crate::truehddec::structs::channel::ChannelLabel;
 
     #[test]
     fn truehd_label_map_matches_renderer_channels() {
@@ -653,52 +600,5 @@ mod tests {
             Some(BedChannel::LowFrequencyEffects2)
         );
         assert_eq!(bed_channel_from_label(ChannelLabel::Cb), None);
-    }
-
-    fn fixture_path(name: &str) -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests")
-            .join("data")
-            .join(name)
-    }
-
-    #[test]
-    fn fixture_smoke_decodes_truehd_objects() -> Result<(), Box<dyn std::error::Error>> {
-        let mut file = File::open(fixture_path("truehd_atmos_prefix_32k.mlp"))?;
-        let mut decoder = BitstreamObjectPcmDecoder::new();
-        let mut buffer = [0u8; 32 * 1024];
-        let mut found_frame = false;
-        let mut found_metadata = false;
-
-        for _ in 0..256 {
-            let read = file.read(&mut buffer)?;
-            if read == 0 {
-                break;
-            }
-            let frames = decoder.push_bytes(&buffer[..read])?;
-            for frame in frames {
-                found_frame = true;
-                if frame.pcm.object_count() > 0 {
-                    let input = RenderFrameSource::to_render_input(&frame.pcm);
-                    assert_eq!(input.object_channels.len(), frame.pcm.object_count());
-                }
-                if !frame.pcm.metadata_updates.is_empty() {
-                    found_metadata = true;
-                }
-            }
-            if found_frame && found_metadata {
-                break;
-            }
-        }
-
-        assert!(
-            found_frame,
-            "expected at least one decoded TrueHD object frame"
-        );
-        assert!(
-            found_metadata,
-            "expected at least one TrueHD metadata update"
-        );
-        Ok(())
     }
 }

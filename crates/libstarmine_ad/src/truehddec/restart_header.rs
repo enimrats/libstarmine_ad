@@ -13,15 +13,13 @@
 //! Contains channel configuration, timing management, dithering parameters,
 //! and channel permutation mapping.
 
-use crate::log_or_err;
-use crate::process::decode::DecoderState;
-use crate::process::parse::ParserState;
-use crate::structs::sync::{
+use crate::truehddec::process::decode::DecoderState;
+use crate::truehddec::process::parse::ParserState;
+use crate::truehddec::structs::sync::{
     BASE_SAMPLING_RATE_CD, MAJOR_SYNC_FBA, MAJOR_SYNC_FBB, UNIMPLEMENTED_FBB_MSG,
 };
-use crate::utils::bitstream_io::BsIoSliceReader;
-use crate::utils::errors::RestartHeaderError;
-use anyhow::{Result, anyhow, bail};
+use crate::truehddec::utils::bitstream_io::BsIoSliceReader;
+use crate::truehddec::utils::errors::{RestartHeaderError, Result};
 use log::Level::Warn;
 use log::{info, trace, warn};
 
@@ -125,7 +123,7 @@ impl RestartHeader {
                 log_or_err!(
                     state,
                     Warn,
-                    anyhow!(RestartHeaderError::OutputTimingMismatch {
+                    (RestartHeaderError::OutputTimingMismatch {
                         read: rh.output_timing,
                         substream: state.substream_index,
                         expected: state.output_timing
@@ -177,7 +175,7 @@ impl RestartHeader {
                         log_or_err!(
                             state,
                             Warn,
-                            anyhow!(RestartHeaderError::OutputTimingAfterJump {
+                            (RestartHeaderError::OutputTimingAfterJump {
                                 read: state.output_timing,
                                 expected: expected_output_timing
                             })
@@ -192,7 +190,7 @@ impl RestartHeader {
                     log_or_err!(
                         state,
                         Warn,
-                        anyhow!(RestartHeaderError::InvalidOutputTiming {
+                        (RestartHeaderError::InvalidOutputTiming {
                             read: state.output_timing,
                             expected: expected_output_timing
                         })
@@ -282,11 +280,7 @@ impl RestartHeader {
                         );
                     }
 
-                    log_or_err!(
-                        state,
-                        Warn,
-                        anyhow!(RestartHeaderError::InvalidSeamlessBranch)
-                    );
+                    log_or_err!(state, Warn, (RestartHeaderError::InvalidSeamlessBranch));
                 }
             }
         }
@@ -294,27 +288,28 @@ impl RestartHeader {
         match rh.restart_sync_word {
             RestartSyncWord::A => {
                 if state.substream_index == 1 && state.substream_info & 8 == 0 {
-                    bail!(RestartHeaderError::InvalidSyncBForSubstream1)
+                    return Err((RestartHeaderError::InvalidSyncBForSubstream1).into());
                 }
             }
             RestartSyncWord::B => {
                 if state.substream_index == 0 {
-                    bail!(RestartHeaderError::InvalidSyncBForSubstream0)
+                    return Err((RestartHeaderError::InvalidSyncBForSubstream0).into());
                 }
             }
             rsw @ RestartSyncWord::C => {
                 if state.substream_index != 3 {
-                    bail!(RestartHeaderError::InvalidSyncC(rsw as u16))
+                    return Err((RestartHeaderError::InvalidSyncC(rsw as u16)).into());
                 }
             }
             _ => {}
         }
 
         if rh.max_bits != rh.max_bits_repeat {
-            bail!(RestartHeaderError::MaxBitsMismatch {
+            return Err((RestartHeaderError::MaxBitsMismatch {
                 first: rh.max_bits,
-                second: rh.max_bits_repeat
+                second: rh.max_bits_repeat,
             })
+            .into());
         }
 
         rh.hires_output_timing = reader.get()?;
@@ -376,19 +371,21 @@ impl RestartHeader {
 
             if state.format_sync == MAJOR_SYNC_FBA {
                 if ch_assign > rh.max_matrix_chan {
-                    bail!(RestartHeaderError::ChannelAssignTooHigh {
+                    return Err((RestartHeaderError::ChannelAssignTooHigh {
                         index: i,
                         value: ch_assign,
-                        max: rh.max_matrix_chan
+                        max: rh.max_matrix_chan,
                     })
+                    .into());
                 } else if state.substream_index == 0
                     && i != ch_assign as usize
                     && state.audio_sampling_frequency_1 >= BASE_SAMPLING_RATE_CD << 2
                 {
-                    bail!(RestartHeaderError::ChannelAssignMisordered {
+                    return Err((RestartHeaderError::ChannelAssignMisordered {
                         index: i,
                         value: ch_assign,
                     })
+                    .into());
                 }
             } else {
                 unimplemented!("{}", UNIMPLEMENTED_FBB_MSG)
@@ -397,9 +394,9 @@ impl RestartHeader {
             let permutation_bit = 1 << ch_assign;
 
             if permutation_bit & permutation != 0 {
-                bail!(RestartHeaderError::ChannelAssignDuplicate(
-                    rh.max_matrix_chan
-                ))
+                return Err(
+                    (RestartHeaderError::ChannelAssignDuplicate(rh.max_matrix_chan)).into(),
+                );
             }
 
             permutation |= permutation_bit;
@@ -414,10 +411,11 @@ impl RestartHeader {
         let crc = reader.crc8_check(&state.crc_restart_block_header, start_pos, len)?;
 
         if crc != rh.restart_header_crc {
-            bail!(RestartHeaderError::RestartHeaderCrcMismatch {
+            return Err((RestartHeaderError::RestartHeaderCrcMismatch {
                 calculated: crc,
-                read: rh.restart_header_crc
-            });
+                read: rh.restart_header_crc,
+            })
+            .into());
         }
 
         state.reset_parser_substream_state();
@@ -445,7 +443,7 @@ impl RestartHeader {
                 1 => substream_info & 8 != 0 || substream_info & 0x60 == 0x20,
                 2 => substream_info & 0x40 != 0,
                 3 => substream_info >> 7 != 0,
-                _ => bail!(RestartHeaderError::InvalidStream),
+                _ => return Err((RestartHeaderError::InvalidStream).into()),
             } {
                 let mut lossless_check_i32 = state.substream_state()?.lossless_check_i32_accum;
                 lossless_check_i32 ^= lossless_check_i32 >> 16;
@@ -461,7 +459,7 @@ impl RestartHeader {
                         log_or_err!(
                             state,
                             Warn,
-                            anyhow!(RestartHeaderError::LosslessCheckMismatch {
+                            (RestartHeaderError::LosslessCheckMismatch {
                                 substream: state.substream_index,
                                 calculated: lossless_check_i32,
                                 read: self.lossless_check

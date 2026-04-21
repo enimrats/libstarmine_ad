@@ -15,15 +15,13 @@
 //!
 //! Optional 8-bit parity check and CRC protection.
 
-use anyhow::{Result, anyhow};
 use log::{trace, warn};
 
-use crate::log_or_err;
-use crate::process::parse::ParserState;
-use crate::structs::block::Block;
-use crate::structs::sync::{MAJOR_SYNC_FBA, MAJOR_SYNC_FBB};
-use crate::utils::bitstream_io::BsIoSliceReader;
-use crate::utils::errors::SubstreamError;
+use crate::truehddec::process::parse::ParserState;
+use crate::truehddec::structs::block::Block;
+use crate::truehddec::structs::sync::{MAJOR_SYNC_FBA, MAJOR_SYNC_FBB};
+use crate::truehddec::utils::bitstream_io::BsIoSliceReader;
+use crate::truehddec::utils::errors::{Result, SubstreamError};
 
 /// Directory entry for substream navigation and control.
 ///
@@ -69,7 +67,7 @@ impl SubstreamDirectory {
                 log_or_err!(
                     state,
                     log::Level::Error,
-                    anyhow!(SubstreamError::InvalidExtraSubstreamWordFbb)
+                    (SubstreamError::InvalidExtraSubstreamWordFbb)
                 );
             }
 
@@ -90,7 +88,7 @@ impl SubstreamDirectory {
             log_or_err!(
                 state,
                 log::Level::Warn,
-                anyhow!(SubstreamError::InvalidRestartNonexistent {
+                (SubstreamError::InvalidRestartNonexistent {
                     expected: !sd.restart_nonexistent,
                     suffix: if state.is_major_sync {
                         "".into()
@@ -139,10 +137,7 @@ impl SubstreamSegment {
             log_or_err!(
                 state,
                 log::Level::Error,
-                anyhow!(
-                    "Substream {} segment not byte-aligned at start",
-                    state.substream_index
-                )
+                SubstreamError::UnalignedSegmentStart(state.substream_index)
             );
         }
 
@@ -155,7 +150,7 @@ impl SubstreamSegment {
                 log_or_err!(
                     state,
                     log::Level::Warn,
-                    anyhow!(SubstreamError::TooManyBlocks(ss.block.len()))
+                    (SubstreamError::TooManyBlocks(ss.block.len()))
                 );
             }
             ss.block.push(Block::read(state, reader)?);
@@ -245,7 +240,7 @@ impl SubstreamSegment {
                 log_or_err!(
                     state,
                     log::Level::Error,
-                    anyhow!(SubstreamError::ParityMismatch {
+                    (SubstreamError::ParityMismatch {
                         substream: state.substream_index,
                         calculated: parity,
                         read: ss.substream_parity
@@ -259,7 +254,7 @@ impl SubstreamSegment {
                 log_or_err!(
                     state,
                     log::Level::Error,
-                    anyhow!(SubstreamError::CrcMismatch {
+                    (SubstreamError::CrcMismatch {
                         substream: state.substream_index,
                         calculated: crc,
                         read: ss.substream_crc
@@ -274,13 +269,13 @@ impl SubstreamSegment {
             log_or_err!(
                 state,
                 log::Level::Error,
-                anyhow!(SubstreamError::UnalignedSegmentEnd(state.substream_index))
+                (SubstreamError::UnalignedSegmentEnd(state.substream_index))
             );
         } else if expected_end_pos != end_pos {
             log_or_err!(
                 state,
                 log::Level::Error,
-                anyhow!(SubstreamError::SubstreamEndMismatch {
+                (SubstreamError::SubstreamEndMismatch {
                     substream: state.substream_index,
                     read: reader.position()?,
                     expected: expected_end_pos

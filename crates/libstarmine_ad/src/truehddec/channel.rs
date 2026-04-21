@@ -3,18 +3,16 @@
 //! Contains channel assignments, filter coefficients, and audio
 //! processing parameters for individual channels in audio streams.
 
-use anyhow::{Result, anyhow, bail};
 use log::Level::Error;
 use log::warn;
 use std::fmt::Display;
 
-use crate::log_or_err;
-use crate::process::decode::DecoderState;
-use crate::process::parse::ParserState;
-use crate::structs::filter::{CoeffType, FilterCoeffs};
-use crate::structs::restart_header::GuardsField;
-use crate::utils::bitstream_io::BsIoSliceReader;
-use crate::utils::errors::ChannelError;
+use crate::truehddec::process::decode::DecoderState;
+use crate::truehddec::process::parse::ParserState;
+use crate::truehddec::structs::filter::{CoeffType, FilterCoeffs};
+use crate::truehddec::structs::restart_header::GuardsField;
+use crate::truehddec::utils::bitstream_io::BsIoSliceReader;
+use crate::truehddec::utils::errors::{ChannelError, Result};
 
 /// Extended channel meaning information for 16-channel presentations.
 ///
@@ -218,7 +216,7 @@ impl ChannelParams {
                 log_or_err!(
                     state,
                     log::Level::Error,
-                    anyhow!(ChannelError::FilterOrderTooHigh {
+                    (ChannelError::FilterOrderTooHigh {
                         a: coeffs_a.order,
                         b: coeffs_b.order
                     })
@@ -229,7 +227,7 @@ impl ChannelParams {
                 log_or_err!(
                     state,
                     Error,
-                    anyhow!(ChannelError::CoeffQMismatch {
+                    (ChannelError::CoeffQMismatch {
                         chan: chi,
                         a_q: coeffs_a.coeff_q,
                         b_q: coeffs_b.coeff_q
@@ -266,7 +264,7 @@ impl ChannelParams {
             log_or_err!(
                 state,
                 Error,
-                anyhow!(ChannelError::HuffLsbsTooLarge {
+                (ChannelError::HuffLsbsTooLarge {
                     chan: chi,
                     max: max_huff_lsbs,
                     actual: cp.huff_lsbs
@@ -437,7 +435,7 @@ impl ChannelGroup {
             1 => Ok(ChannelGroup::LtRt),
             2 => Ok(ChannelGroup::LbinRbin),
             3 => Ok(ChannelGroup::Mono),
-            _ => bail!("Invalid channel group modifier: {}", modifier),
+            _ => return Err((ChannelError::InvalidChannelGroupModifier(modifier)).into()),
         }
     }
 }

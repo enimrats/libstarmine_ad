@@ -13,11 +13,9 @@
 //! Filter coefficients use configurable precision with quantization parameters
 //! and filter state management.
 
-use anyhow::{Result, bail};
-
-use crate::process::decode::DecoderState;
-use crate::utils::bitstream_io::BsIoSliceReader;
-use crate::utils::errors::FilterError;
+use crate::truehddec::process::decode::DecoderState;
+use crate::truehddec::utils::bitstream_io::BsIoSliceReader;
+use crate::truehddec::utils::errors::{FilterError, Result};
 
 /// FIR filter coefficients for one channel.
 ///
@@ -58,34 +56,34 @@ impl FilterCoeffs {
         };
 
         if coeff_type == CoeffType::A && fc.order > 8 {
-            bail!(FilterError::FilterAOrderTooHigh(fc.order));
+            return Err((FilterError::FilterAOrderTooHigh(fc.order)).into());
         } else if coeff_type == CoeffType::B && fc.order > 4 {
-            bail!(FilterError::FilterBOrderTooHigh(fc.order));
+            return Err((FilterError::FilterBOrderTooHigh(fc.order)).into());
         }
 
         if fc.order != 0 {
             fc.coeff_q = reader.get_n(4)?;
 
             if fc.coeff_q < 8 {
-                bail!(FilterError::InvalidCoeffQ(fc.coeff_q));
+                return Err((FilterError::InvalidCoeffQ(fc.coeff_q)).into());
             }
 
             fc.coeff_bits = reader.get_n(5)?;
 
             if fc.coeff_bits > 16 || fc.coeff_bits == 0 {
-                bail!(FilterError::InvalidCoeffBits(fc.coeff_bits));
+                return Err((FilterError::InvalidCoeffBits(fc.coeff_bits)).into());
             }
 
             fc.coeff_shift = reader.get_n(3)?;
 
             if fc.coeff_shift > 7 {
-                bail!(FilterError::InvalidCoeffShift(fc.coeff_shift));
+                return Err((FilterError::InvalidCoeffShift(fc.coeff_shift)).into());
             }
 
             let total_bits = fc.coeff_bits + fc.coeff_shift;
 
             if total_bits > 16 {
-                bail!(FilterError::TotalCoeffBitsTooLarge(total_bits));
+                return Err((FilterError::TotalCoeffBitsTooLarge(total_bits)).into());
             }
 
             for i in 0..fc.order as usize {
@@ -99,7 +97,7 @@ impl FilterCoeffs {
                 coeff <<= fc.coeff_shift;
 
                 if coeff == -32768 {
-                    bail!(FilterError::InvalidCoeffValue);
+                    return Err((FilterError::InvalidCoeffValue).into());
                 }
 
                 fc.coeff[i] = coeff;
@@ -109,7 +107,7 @@ impl FilterCoeffs {
 
             if fc.new_states {
                 if coeff_type == CoeffType::A {
-                    bail!(FilterError::FilterANewStatesNotAllowed);
+                    return Err((FilterError::FilterANewStatesNotAllowed).into());
                 }
 
                 fc.state_bits = reader.get_n(4)?;
@@ -126,7 +124,7 @@ impl FilterCoeffs {
                     state <<= fc.state_shift;
 
                     if !(-(1 << 23)..(1 << 23)).contains(&state) {
-                        bail!(FilterError::FilterStateOutOfRange(state));
+                        return Err((FilterError::FilterStateOutOfRange(state)).into());
                     }
 
                     fc.state[i] = state;

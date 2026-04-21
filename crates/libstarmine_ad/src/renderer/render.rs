@@ -7,6 +7,7 @@ use super::types::{BedChannel, ObjectAnchor, Vec3};
 use std::arch::aarch64::{
     vabsq_f32, vdupq_n_f32, vfmaq_f32, vld1q_f32, vmaxq_f32, vmaxvq_f32, vmulq_f32, vst1q_f32,
 };
+use thiserror::Error;
 
 const RENDER_TIMESLOT_SAMPLES: usize = 64;
 const RENDER_714_CHANNELS: usize = 12;
@@ -151,52 +152,24 @@ impl Render714Frame {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 /// Errors returned by the 7.1.4 renderer.
 pub enum Render714Error {
+    #[error("missing-oamd")]
     MissingOamd,
+    #[error("oamd-state-uninitialized")]
     OamdStateUninitialized,
+    #[error("object-count-mismatch expected={expected} provided={provided}")]
     ObjectCountMismatch { expected: usize, provided: usize },
+    #[error("bed-channel-count-mismatch expected={expected} provided={provided}")]
     BedChannelCountMismatch { expected: usize, provided: usize },
+    #[error("unsupported-sample-count {0}")]
     UnsupportedSampleCount(usize),
+    #[error("unsupported-bed-channel {0:?}")]
     UnsupportedBedChannel(BedChannel),
+    #[error("sample-rate-changed expected={expected} provided={provided}")]
     SampleRateChanged { expected: u32, provided: u32 },
 }
-
-impl std::fmt::Display for Render714Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::MissingOamd => write!(f, "missing-oamd"),
-            Self::OamdStateUninitialized => write!(f, "oamd-state-uninitialized"),
-            Self::ObjectCountMismatch { expected, provided } => {
-                write!(
-                    f,
-                    "object-count-mismatch expected={expected} provided={provided}"
-                )
-            }
-            Self::BedChannelCountMismatch { expected, provided } => {
-                write!(
-                    f,
-                    "bed-channel-count-mismatch expected={expected} provided={provided}"
-                )
-            }
-            Self::UnsupportedSampleCount(samples) => {
-                write!(f, "unsupported-sample-count {samples}")
-            }
-            Self::UnsupportedBedChannel(channel) => {
-                write!(f, "unsupported-bed-channel {:?}", channel)
-            }
-            Self::SampleRateChanged { expected, provided } => {
-                write!(
-                    f,
-                    "sample-rate-changed expected={expected} provided={provided}"
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for Render714Error {}
 
 #[derive(Debug, Clone, Copy)]
 struct RenderInputChannelRef<'a> {

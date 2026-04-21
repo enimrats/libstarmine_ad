@@ -1,10 +1,9 @@
-use crate::process::{MAX_PRESENTATIONS, PresentationMap, PresentationType};
-use crate::structs::access_unit::AccessUnit;
-use crate::structs::channel::ChannelLabel;
-use crate::structs::oamd::ObjectAudioMetadataPayload;
-use crate::utils::dither::dither_31eb;
-use crate::utils::errors::DecodeError;
-use anyhow::{Result, bail};
+use crate::truehddec::process::{MAX_PRESENTATIONS, PresentationMap, PresentationType};
+use crate::truehddec::structs::access_unit::AccessUnit;
+use crate::truehddec::structs::channel::ChannelLabel;
+use crate::truehddec::structs::oamd::ObjectAudioMetadataPayload;
+use crate::truehddec::utils::dither::dither_31eb;
+use crate::truehddec::utils::errors::{DecodeError, Result};
 use log::{info, trace};
 use std::collections::VecDeque;
 
@@ -327,7 +326,7 @@ impl DecoderState {
 
     fn update_presentation(&mut self, presentation: usize) -> Result<()> {
         let Some(presentation_map) = self.presentation_map else {
-            bail!("Presentation map not initialized");
+            return Err((DecodeError::PresentationMapNotInitialized).into());
         };
 
         let mut presentations = [false; MAX_PRESENTATIONS];
@@ -342,7 +341,7 @@ impl DecoderState {
                 if !self.valid {
                     let Some(max_independent) = presentation_map.max_independent_presentation()
                     else {
-                        bail!("No presentation is available");
+                        return Err((DecodeError::NoPresentationAvailable).into());
                     };
                     info!(
                         "Presentation {presentation} is not available, using presentation {max_independent}"
@@ -452,16 +451,16 @@ impl DecoderState {
                     let iir_state = fir_state - pred;
 
                     if fir_state >= max_val {
-                        bail!(DecodeError::RecorrelatorPositiveSaturation(fir_state));
+                        return Err((DecodeError::RecorrelatorPositiveSaturation(fir_state)).into());
                     } else if fir_state < min_val {
-                        bail!(DecodeError::RecorrelatorNegativeSaturation(fir_state));
+                        return Err((DecodeError::RecorrelatorNegativeSaturation(fir_state)).into());
                     }
 
                     if !(min_val..max_val).contains(&iir_state) {
                         if restart_sync_word == 0x31EC {
-                            bail!(DecodeError::FilterBInputTooWide32(iir_state));
+                            return Err((DecodeError::FilterBInputTooWide32(iir_state)).into());
                         } else {
-                            bail!(DecodeError::FilterBInputTooWide24(iir_state));
+                            return Err((DecodeError::FilterBInputTooWide24(iir_state)).into());
                         }
                     }
 

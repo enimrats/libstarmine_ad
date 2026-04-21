@@ -1,6 +1,7 @@
 #![allow(clippy::collapsible_if)]
 
 mod raw_eac3;
+mod raw_truehd;
 
 use std::env;
 use std::fs::{self, File};
@@ -10,6 +11,7 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use raw_eac3::RawEac3FrameIter;
+use raw_truehd::RawTrueHdAccessUnitIter;
 use starmine_ad::{
     eac3dec::{
         CorePcmFrame, Decoder, JocObjectMatrices, ObjectPcmDecoder,
@@ -19,8 +21,7 @@ use starmine_ad::{
         BedChannel, RENDER_714_CHANNEL_ORDER, Render714Frame, Render714TimeslotDebug, Renderer714,
     },
     truehddec::{
-        BitstreamObjectPcmDecoder as TrueHdBitstreamObjectPcmDecoder,
-        ObjectPcmFrame as TrueHdObjectPcmFrame,
+        ObjectPcmDecoder as TrueHdObjectPcmDecoder, ObjectPcmFrame as TrueHdObjectPcmFrame,
     },
 };
 
@@ -1258,7 +1259,7 @@ fn process_raw_truehd(input: &Path, bytes: &[u8], options: &RunOptions) -> ExitC
     let use_render_714 = options.render_714_check
         || options.dump_render_714_wav.is_some()
         || options.dump_render_positions_csv.is_some();
-    let mut object_decoder = TrueHdBitstreamObjectPcmDecoder::new();
+    let mut object_decoder = TrueHdObjectPcmDecoder::new();
     let mut renderer_714 = Renderer714::new();
     let mut object_dump_writer = match options.dump_objects_f32.as_deref() {
         Some(path) => match ObjectDumpWriter::create(path) {
@@ -1320,69 +1321,100 @@ fn process_raw_truehd(input: &Path, bytes: &[u8], options: &RunOptions) -> ExitC
             .unwrap_or_else(|| "-".to_string()),
     );
 
-    'chunks: for chunk in bytes.chunks(32 * 1024) {
-        let results = match object_decoder.push_bytes(chunk) {
-            Ok(results) => results,
+    'frames: for access_unit in RawTrueHdAccessUnitIter::new(bytes) {
+        let access_unit = match access_unit {
+            Ok(access_unit) => access_unit,
             Err(err) => {
-                eprintln!("truehd decoder error after {} frames: {err}", frames);
+                eprintln!(
+                    "truehd access-unit split error after {} frames: {err}",
+                    frames
+                );
                 return ExitCode::FAILURE;
             }
         };
 
-        for result in results {
-            let (render_714, render_debug) = if use_render_714 {
-                let render_input = result.pcm.to_render_input();
-                if render_positions_writer.is_some() {
-                    match renderer_714.push_frame_with_debug(&render_input) {
-                        Ok((rendered, debug)) => (Some(rendered), Some(debug)),
-                        Err(err) => {
-                            eprintln!("render 7.1.4 error on frame {}: {err}", frames);
-                            return ExitCode::FAILURE;
-                        }
-                    }
-                } else {
-                    match renderer_714.push_frame(&render_input) {
-                        Ok(rendered) => (Some(rendered), None),
-                        Err(err) => {
-                            eprintln!("render 7.1.4 error on frame {}: {err}", frames);
-                            return ExitCode::FAILURE;
-                        }
+        let result = match object_decoder.push_access_unit(access_unit.bytes) {
+            Ok(Some(result)) => result,
+            Ok(None) => continue,
+            Err(err) => {
+                eprintln!(
+                    "truehd decoder error at byte {} after {} frames: {err}",
+                    access_unit.offset, frames
+                );
+                return ExitCode::FAILURE;
+            }
+        };
+
+        let (render_714, render_debug) = if use_render_714 {
+            let render_input = result.pcm.to_render_input();
+            if render_positions_writer.is_some() {
+                match renderer_714.push_frame_with_debug(&render_input) {
+                    Ok((rendered, debug)) => (Some(rendered), Some(debug)),
+                    Err(err) => {
+                        eprintln!("render 7.1.4 error on frame {}: {err}", frames);
+                        return ExitCode::FAILURE;
                     }
                 }
             } else {
-                (None, None)
-            };
+                match renderer_714.push_frame(&render_input) {
+                    Ok(rendered) => (Some(rendered), None),
+                    Err(err) => {
+                        eprintln!("render 7.1.4 error on frame {}: {err}", frames);
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+        } else {
+            (None, None)
+        };
 
-            progress.record_samples(result.pcm.sample_rate, result.pcm.samples_per_channel());
-            let progress_status = progress.format_status();
+        progress.record_samples(result.pcm.sample_rate, result.pcm.samples_per_channel());
+        let progress_status = progress.format_status();
 
-            println!(
-                "frame={} access_units_seen={} frames_seen={} {} truehd sample_rate={} bedpcm={}s/{}ch objectpcm={}obj metadata_updates={}{}",
-                frames,
-                result.access_units_seen,
-                result.frames_seen,
-                progress_status,
-                result.pcm.sample_rate,
-                result.pcm.samples_per_channel(),
-                result.pcm.bed_channel_count(),
-                result.pcm.object_count(),
-                result.pcm.metadata_updates.len(),
-                render_714
-                    .as_ref()
-                    .map(|rendered| format!(
-                        " render714={}s/{}ch",
-                        rendered.samples_per_channel(),
-                        rendered.channel_count()
-                    ))
-                    .unwrap_or_default(),
-            );
+        println!(
+            "frame={} access_units_seen={} frames_seen={} {} truehd sample_rate={} bedpcm={}s/{}ch objectpcm={}obj metadata_updates={}{}",
+            frames,
+            result.access_units_seen,
+            result.frames_seen,
+            progress_status,
+            result.pcm.sample_rate,
+            result.pcm.samples_per_channel(),
+            result.pcm.bed_channel_count(),
+            result.pcm.object_count(),
+            result.pcm.metadata_updates.len(),
+            render_714
+                .as_ref()
+                .map(|rendered| format!(
+                    " render714={}s/{}ch",
+                    rendered.samples_per_channel(),
+                    rendered.channel_count()
+                ))
+                .unwrap_or_default(),
+        );
 
-            if let Some(writer) = object_dump_writer.as_mut() {
-                match writer.write_truehd_frame(&result.pcm) {
-                    Ok(Some(summary)) => println!(
-                        "objectpcm_summary={} sample_rate={} path={}",
-                        summary,
-                        result.pcm.sample_rate,
+        if let Some(writer) = object_dump_writer.as_mut() {
+            match writer.write_truehd_frame(&result.pcm) {
+                Ok(Some(summary)) => println!(
+                    "objectpcm_summary={} sample_rate={} path={}",
+                    summary,
+                    result.pcm.sample_rate,
+                    writer.path.display(),
+                ),
+                Ok(None) => {}
+                Err(err) => {
+                    eprintln!("{err}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+
+        if let Some(rendered) = render_714.as_ref() {
+            if let Some(writer) = render_714_writer.as_mut() {
+                match writer.write_frame(rendered) {
+                    Ok(Some(layout)) => println!(
+                        "render714_layout={} sample_rate={} path={}",
+                        layout,
+                        rendered.sample_rate,
                         writer.path.display(),
                     ),
                     Ok(None) => {}
@@ -1393,48 +1425,30 @@ fn process_raw_truehd(input: &Path, bytes: &[u8], options: &RunOptions) -> ExitC
                 }
             }
 
-            if let Some(rendered) = render_714.as_ref() {
-                if let Some(writer) = render_714_writer.as_mut() {
-                    match writer.write_frame(rendered) {
-                        Ok(Some(layout)) => println!(
-                            "render714_layout={} sample_rate={} path={}",
-                            layout,
-                            rendered.sample_rate,
-                            writer.path.display(),
-                        ),
-                        Ok(None) => {}
-                        Err(err) => {
-                            eprintln!("{err}");
-                            return ExitCode::FAILURE;
-                        }
+            if let (Some(writer), Some(debug)) =
+                (render_positions_writer.as_mut(), render_debug.as_deref())
+            {
+                match writer.write_timeslots(rendered_output_samples, debug) {
+                    Ok(Some(summary)) => println!(
+                        "render714_positions_summary={} sample_rate={} path={}",
+                        summary,
+                        rendered.sample_rate,
+                        writer.path.display(),
+                    ),
+                    Ok(None) => {}
+                    Err(err) => {
+                        eprintln!("{err}");
+                        return ExitCode::FAILURE;
                     }
                 }
-
-                if let (Some(writer), Some(debug)) =
-                    (render_positions_writer.as_mut(), render_debug.as_deref())
-                {
-                    match writer.write_timeslots(rendered_output_samples, debug) {
-                        Ok(Some(summary)) => println!(
-                            "render714_positions_summary={} sample_rate={} path={}",
-                            summary,
-                            rendered.sample_rate,
-                            writer.path.display(),
-                        ),
-                        Ok(None) => {}
-                        Err(err) => {
-                            eprintln!("{err}");
-                            return ExitCode::FAILURE;
-                        }
-                    }
-                }
-
-                rendered_output_samples += rendered.samples_per_channel();
             }
 
-            frames += 1;
-            if options.limit.is_some_and(|limit| frames >= limit) {
-                break 'chunks;
-            }
+            rendered_output_samples += rendered.samples_per_channel();
+        }
+
+        frames += 1;
+        if options.limit.is_some_and(|limit| frames >= limit) {
+            break 'frames;
         }
     }
 

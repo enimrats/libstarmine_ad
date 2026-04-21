@@ -12,15 +12,13 @@
 //! Coefficients can be updated with delta encoding and bit masks controlling
 //! which coefficients are modified.
 
-use anyhow::{Result, anyhow};
 use log::Level::Warn;
 
-use crate::log_or_err;
-use crate::process::decode::DecoderState;
-use crate::process::parse::ParserState;
-use crate::structs::sync::BASE_SAMPLING_RATE_CD;
-use crate::utils::bitstream_io::BsIoSliceReader;
-use crate::utils::errors::MatrixError;
+use crate::truehddec::process::decode::DecoderState;
+use crate::truehddec::process::parse::ParserState;
+use crate::truehddec::structs::sync::BASE_SAMPLING_RATE_CD;
+use crate::truehddec::utils::bitstream_io::BsIoSliceReader;
+use crate::truehddec::utils::errors::{MatrixError, Result};
 
 /// Matrix primitive for single-channel decorrelation.
 ///
@@ -213,7 +211,7 @@ impl Matrixing {
                 log_or_err!(
                     state,
                     Warn,
-                    anyhow!(MatrixError::MatrixChannelTooHigh {
+                    (MatrixError::MatrixChannelTooHigh {
                         index: pmi,
                         max: max_matrix_chan,
                         actual: matrices.matrix_ch,
@@ -223,7 +221,7 @@ impl Matrixing {
                 log_or_err!(
                     state,
                     Warn,
-                    anyhow!(MatrixError::FracBitsTooHigh(matrices.frac_bits))
+                    (MatrixError::FracBitsTooHigh(matrices.frac_bits))
                 );
             } else if current_substream_index == 0
                 && matrices.lsb_bypass_used
@@ -233,7 +231,7 @@ impl Matrixing {
                 log_or_err!(
                     state,
                     Warn,
-                    anyhow!(MatrixError::InvalidLsbBypass {
+                    (MatrixError::InvalidLsbBypass {
                         info: this_substream_info
                     })
                 );

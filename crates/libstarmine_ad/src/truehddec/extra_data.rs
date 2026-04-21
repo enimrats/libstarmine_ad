@@ -3,14 +3,12 @@
 //! This module contains structures for handling extra data sections,
 //! which may contain Evolution frames and other auxiliary information.
 
-use anyhow::{Result, anyhow};
 use log::trace;
 
-use crate::log_or_err;
-use crate::process::parse::ParserState;
-use crate::structs::evolution::EvoFrame;
-use crate::utils::bitstream_io::BsIoSliceReader;
-use crate::utils::errors::ExtraDataError;
+use crate::truehddec::process::parse::ParserState;
+use crate::truehddec::structs::evolution::EvoFrame;
+use crate::truehddec::utils::bitstream_io::BsIoSliceReader;
+use crate::truehddec::utils::errors::{ExtraDataError, Result};
 
 /// Extra data container for auxiliary information
 #[derive(Debug, Default)]
@@ -30,7 +28,7 @@ impl ExtraData {
             log_or_err!(
                 state,
                 log::Level::Warn,
-                anyhow!(ExtraDataError::MisalignedExtraDataStart)
+                (ExtraDataError::MisalignedExtraDataStart)
             );
         }
 
@@ -44,11 +42,7 @@ impl ExtraData {
         if extra_data.header_check_nibble == 0 && extra_data.extra_data_length == 0 {
             while reader.position()? < state.expected_au_end_pos() as u64 {
                 if reader.get_n::<u16>(16)? != 0 {
-                    log_or_err!(
-                        state,
-                        log::Level::Warn,
-                        anyhow!(ExtraDataError::PaddingNotZero)
-                    );
+                    log_or_err!(state, log::Level::Warn, (ExtraDataError::PaddingNotZero));
                 }
 
                 extra_data.ectra_data_padding += 16;
@@ -68,7 +62,7 @@ impl ExtraData {
             log_or_err!(
                 state,
                 log::Level::Warn,
-                anyhow!(ExtraDataError::LengthParityFailed(parity))
+                (ExtraDataError::LengthParityFailed(parity))
             );
         }
 
@@ -81,7 +75,7 @@ impl ExtraData {
             log_or_err!(
                 state,
                 log::Level::Warn,
-                anyhow!(ExtraDataError::ExtraDataTooLong {
+                (ExtraDataError::ExtraDataTooLong {
                     length: extra_data.extra_data_length,
                     remaining: expected_remaining_bits
                 })
@@ -96,7 +90,7 @@ impl ExtraData {
                 log_or_err!(
                     state,
                     log::Level::Warn,
-                    anyhow!(ExtraDataError::EvoFrameTooLong {
+                    (ExtraDataError::EvoFrameTooLong {
                         evo_len: extra_data.evo_frame_byte_length,
                         extra_len: extra_data.extra_data_length
                     })
@@ -107,7 +101,7 @@ impl ExtraData {
                 log_or_err!(
                     state,
                     log::Level::Warn,
-                    anyhow!(ExtraDataError::EvoFrameMisaligned)
+                    (ExtraDataError::EvoFrameMisaligned)
                 );
             }
 
@@ -120,7 +114,7 @@ impl ExtraData {
                     log_or_err!(
                         state,
                         log::Level::Warn,
-                        anyhow!(ExtraDataError::EvoFramePaddingNotZero)
+                        (ExtraDataError::EvoFramePaddingNotZero)
                     );
                 }
             }
@@ -137,7 +131,7 @@ impl ExtraData {
             log_or_err!(
                 state,
                 log::Level::Warn,
-                anyhow!(ExtraDataError::ExtraDataParityMismatch {
+                (ExtraDataError::ExtraDataParityMismatch {
                     expected: parity,
                     actual: extra_data.extra_data_parity
                 })

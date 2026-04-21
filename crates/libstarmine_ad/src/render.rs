@@ -1063,36 +1063,90 @@ fn mix_bed_objects_to_714(
         .copied()
         .zip(bed_sources.iter())
     {
-        let input_channel = input_bed_channels
-            .iter()
-            .copied()
-            .find(|channel| channel.channel == bed_channel)
+        let input_channel = find_matching_input_bed_channel(bed_channel, input_bed_channels)
             .ok_or(Render714Error::BedChannelCountMismatch {
                 expected: metadata_bed_channels
                     .iter()
-                    .filter(|candidate| **candidate == bed_channel)
+                    .filter(|candidate| bed_channel_matches_input(bed_channel, **candidate))
                     .count(),
                 provided: input_bed_channels
                     .iter()
-                    .filter(|candidate| candidate.channel == bed_channel)
+                    .filter(|candidate| bed_channel_matches_input(bed_channel, candidate.channel))
                     .count(),
             })?;
-        let output_channel = map_bed_channel_to_714(bed_channel)
-            .ok_or(Render714Error::UnsupportedBedChannel(bed_channel))?;
         match bed_channel {
-            BedChannel::LowFrequencyEffects => mix_full_channel(
+            BedChannel::LowFrequencyEffects | BedChannel::LowFrequencyEffects2 => mix_full_channel(
                 input_channel.samples,
-                &mut output[output_channel],
+                &mut output[RENDER_714_LFE_INDEX],
                 source.gain * LFE_SEND_MINUS_10_DB,
             ),
-            _ => mix_full_channel(
+            BedChannel::TopSurroundLeft
+            | BedChannel::TopSurroundRight
+            | BedChannel::WideLeft
+            | BedChannel::WideRight => mix_folded_bed_channel_to_714(
                 input_channel.samples,
-                &mut output[output_channel],
+                output,
+                bed_channel,
                 source.gain,
             ),
+            _ => {
+                let output_channel = map_bed_channel_to_714(bed_channel)
+                    .ok_or(Render714Error::UnsupportedBedChannel(bed_channel))?;
+                mix_full_channel(
+                    input_channel.samples,
+                    &mut output[output_channel],
+                    source.gain,
+                );
+            }
         }
     }
     Ok(())
+}
+
+fn find_matching_input_bed_channel<'a>(
+    requested: BedChannel,
+    input_bed_channels: &[RenderInputChannelRef<'a>],
+) -> Option<RenderInputChannelRef<'a>> {
+    input_bed_channels
+        .iter()
+        .copied()
+        .find(|channel| channel.channel == requested)
+        .or_else(|| {
+            if is_low_frequency_bed(requested) {
+                input_bed_channels
+                    .iter()
+                    .copied()
+                    .find(|channel| is_low_frequency_bed(channel.channel))
+            } else {
+                None
+            }
+        })
+}
+
+fn bed_channel_matches_input(requested: BedChannel, provided: BedChannel) -> bool {
+    requested == provided || (is_low_frequency_bed(requested) && is_low_frequency_bed(provided))
+}
+
+fn is_low_frequency_bed(channel: BedChannel) -> bool {
+    matches!(
+        channel,
+        BedChannel::LowFrequencyEffects | BedChannel::LowFrequencyEffects2
+    )
+}
+
+fn mix_folded_bed_channel_to_714(
+    input: &[f32],
+    output: &mut [Vec<f32>],
+    channel: BedChannel,
+    gain: f32,
+) {
+    let source = DynamicSourceState {
+        gain,
+        size: 0.0,
+        cubical_position: bed_channel_position(channel),
+        position_valid: true,
+    };
+    render_object_timeslot_to_714(input, output, 0, &source);
 }
 
 fn map_bed_channel_to_714(channel: BedChannel) -> Option<usize> {
@@ -1109,7 +1163,6 @@ fn map_bed_channel_to_714(channel: BedChannel) -> Option<usize> {
         BedChannel::TopFrontRight => Some(9),
         BedChannel::TopRearLeft => Some(10),
         BedChannel::TopRearRight => Some(11),
-        // TODO: Downmix top-side/wide/LFE2 beds when we encounter streams that need them.
         BedChannel::TopSurroundLeft
         | BedChannel::TopSurroundRight
         | BedChannel::WideLeft
@@ -1547,11 +1600,7 @@ fn fix_incomplete_layer(
 }
 
 fn ratio(a: f32, b: f32, x: f32) -> f32 {
-    if a == b {
-        0.0
-    } else {
-        (x - a) / (b - a)
-    }
+    if a == b { 0.0 } else { (x - a) / (b - a) }
 }
 
 #[cfg(test)]
@@ -1902,10 +1951,10 @@ fn validate_render_input_sample_counts(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_output_limiter, map_bed_channel_to_714, mix_bed_objects_to_714, BedSourceState,
-        DynamicSourceState, ElementRendererState, ObjectInfoBlockState, Render714Frame,
-        RenderInputChannel, RenderInputChannelRef, RenderInputFrame, Renderer714,
-        RENDER_714_CHANNELS, RENDER_714_CHANNEL_ORDER,
+        BedSourceState, DynamicSourceState, ElementRendererState, ObjectInfoBlockState,
+        RENDER_714_CHANNEL_ORDER, RENDER_714_CHANNELS, Render714Frame, RenderInputChannel,
+        RenderInputChannelRef, RenderInputFrame, Renderer714, apply_output_limiter,
+        map_bed_channel_to_714, mix_bed_objects_to_714, render_object_timeslot_to_714,
     };
     use crate::metadata::{
         BedChannel, OamdBlockUpdate, OamdElement, OamdElementKind, OamdObjectBlock,
@@ -2118,6 +2167,177 @@ mod tests {
         .expect("duplicate metadata beds should reuse the labeled input");
 
         assert_eq!(output[0][0], 1.5);
+    }
+
+    #[test]
+    fn mix_bed_objects_folds_wide_beds_like_static_objects() {
+        let input_bed_channels = [RenderInputChannelRef {
+            channel: BedChannel::WideLeft,
+            samples: &[1.0],
+        }];
+        let metadata_bed_channels = [BedChannel::WideLeft];
+        let bed_sources = vec![BedSourceState { gain: 0.5 }];
+        let mut output = vec![vec![0.0; 1]; RENDER_714_CHANNELS];
+
+        mix_bed_objects_to_714(
+            &input_bed_channels,
+            &metadata_bed_channels,
+            &bed_sources,
+            &mut output,
+        )
+        .expect("wide beds should fold to 7.1.4");
+
+        let mut expected = vec![vec![0.0; 1]; RENDER_714_CHANNELS];
+        render_object_timeslot_to_714(
+            &[1.0],
+            &mut expected,
+            0,
+            &DynamicSourceState {
+                gain: 0.5,
+                size: 0.0,
+                cubical_position: super::bed_channel_position(BedChannel::WideLeft),
+                position_valid: true,
+            },
+        );
+
+        assert_channels_close(&output, &expected);
+        assert!(output[0][0] > 0.0);
+        assert!(output[6][0] > 0.0);
+    }
+
+    #[test]
+    fn mix_bed_objects_folds_top_side_beds_like_static_objects() {
+        let input_bed_channels = [RenderInputChannelRef {
+            channel: BedChannel::TopSurroundLeft,
+            samples: &[1.0],
+        }];
+        let metadata_bed_channels = [BedChannel::TopSurroundLeft];
+        let bed_sources = vec![BedSourceState { gain: 0.5 }];
+        let mut output = vec![vec![0.0; 1]; RENDER_714_CHANNELS];
+
+        mix_bed_objects_to_714(
+            &input_bed_channels,
+            &metadata_bed_channels,
+            &bed_sources,
+            &mut output,
+        )
+        .expect("top-side beds should fold to 7.1.4");
+
+        let mut expected = vec![vec![0.0; 1]; RENDER_714_CHANNELS];
+        render_object_timeslot_to_714(
+            &[1.0],
+            &mut expected,
+            0,
+            &DynamicSourceState {
+                gain: 0.5,
+                size: 0.0,
+                cubical_position: super::bed_channel_position(BedChannel::TopSurroundLeft),
+                position_valid: true,
+            },
+        );
+
+        assert_channels_close(&output, &expected);
+        assert!(output[8][0] > 0.0);
+        assert!(output[10][0] > 0.0);
+    }
+
+    #[test]
+    fn mix_bed_objects_merges_lfe2_into_primary_lfe() {
+        let input_bed_channels = [RenderInputChannelRef {
+            channel: BedChannel::LowFrequencyEffects2,
+            samples: &[1.0],
+        }];
+        let metadata_bed_channels = [BedChannel::LowFrequencyEffects2];
+        let bed_sources = vec![BedSourceState { gain: 0.5 }];
+        let mut output = vec![vec![0.0; 1]; RENDER_714_CHANNELS];
+
+        mix_bed_objects_to_714(
+            &input_bed_channels,
+            &metadata_bed_channels,
+            &bed_sources,
+            &mut output,
+        )
+        .expect("LFE2 should merge into the primary LFE output");
+
+        assert!((output[3][0] - 0.5 * super::LFE_SEND_MINUS_10_DB).abs() < 1e-6);
+        for (index, channel) in output.iter().enumerate() {
+            if index != 3 {
+                assert_eq!(channel[0], 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn mix_bed_objects_accepts_lfe_alias_when_metadata_uses_lfe2() {
+        let input_bed_channels = [RenderInputChannelRef {
+            channel: BedChannel::LowFrequencyEffects,
+            samples: &[1.0],
+        }];
+        let metadata_bed_channels = [BedChannel::LowFrequencyEffects2];
+        let bed_sources = vec![BedSourceState { gain: 0.5 }];
+        let mut output = vec![vec![0.0; 1]; RENDER_714_CHANNELS];
+
+        mix_bed_objects_to_714(
+            &input_bed_channels,
+            &metadata_bed_channels,
+            &bed_sources,
+            &mut output,
+        )
+        .expect("LFE should satisfy LFE2 metadata assignments");
+
+        assert!((output[3][0] - 0.5 * super::LFE_SEND_MINUS_10_DB).abs() < 1e-6);
+    }
+
+    #[test]
+    fn mix_bed_objects_accepts_lfe_alias_when_input_uses_lfe2() {
+        let input_bed_channels = [RenderInputChannelRef {
+            channel: BedChannel::LowFrequencyEffects2,
+            samples: &[1.0],
+        }];
+        let metadata_bed_channels = [BedChannel::LowFrequencyEffects];
+        let bed_sources = vec![BedSourceState { gain: 0.5 }];
+        let mut output = vec![vec![0.0; 1]; RENDER_714_CHANNELS];
+
+        mix_bed_objects_to_714(
+            &input_bed_channels,
+            &metadata_bed_channels,
+            &bed_sources,
+            &mut output,
+        )
+        .expect("LFE2 should satisfy LFE metadata assignments");
+
+        assert!((output[3][0] - 0.5 * super::LFE_SEND_MINUS_10_DB).abs() < 1e-6);
+    }
+
+    #[test]
+    fn mix_bed_objects_prefers_exact_lfe_matches_when_both_inputs_exist() {
+        let input_bed_channels = [
+            RenderInputChannelRef {
+                channel: BedChannel::LowFrequencyEffects2,
+                samples: &[2.0],
+            },
+            RenderInputChannelRef {
+                channel: BedChannel::LowFrequencyEffects,
+                samples: &[1.0],
+            },
+        ];
+        let metadata_bed_channels = [
+            BedChannel::LowFrequencyEffects,
+            BedChannel::LowFrequencyEffects2,
+        ];
+        let bed_sources = vec![BedSourceState { gain: 0.5 }, BedSourceState { gain: 0.25 }];
+        let mut output = vec![vec![0.0; 1]; RENDER_714_CHANNELS];
+
+        mix_bed_objects_to_714(
+            &input_bed_channels,
+            &metadata_bed_channels,
+            &bed_sources,
+            &mut output,
+        )
+        .expect("LFE and LFE2 metadata should use their exact inputs when both are present");
+
+        let expected_lfe = (1.0 * 0.5 + 2.0 * 0.25) * super::LFE_SEND_MINUS_10_DB;
+        assert!((output[3][0] - expected_lfe).abs() < 1e-6);
     }
 
     #[test]

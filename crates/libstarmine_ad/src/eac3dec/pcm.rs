@@ -1,11 +1,10 @@
-use crate::joc::{JocObjectDecoderState, JocObjectMatrices};
-use crate::metadata::{
-    BedChannel, JocPayload, MetadataParseState, OamdPayload, ParsedEmdfPayloadData,
-};
-use crate::syncframe::{
+use super::joc::{JocObjectDecoderState, JocObjectMatrices};
+use super::metadata::{JocPayload, MetadataParseState, OamdPayload, ParsedEmdfPayloadData};
+use super::syncframe::{
     AccessUnitInfo, CoreDecodeState, ParseError, decode_core_pcm_frame_with_state,
     inspect_access_unit_with_metadata_state,
 };
+use crate::renderer::BedChannel;
 
 #[derive(Debug, Clone, PartialEq)]
 /// Decoded core channel PCM for one access unit.

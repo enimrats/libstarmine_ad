@@ -1,5 +1,6 @@
-use crate::bitstream::BitReader;
-use crate::syncframe::ParseError;
+use super::bitstream::BitReader;
+use super::syncframe::ParseError;
+use crate::renderer::{BedChannel, ObjectAnchor, Vec3};
 
 const ISF_OBJECT_COUNT: [usize; 6] = [4, 8, 10, 14, 15, 30];
 const SAMPLE_OFFSET_INDEX: [u8; 4] = [8, 16, 18, 24];
@@ -46,41 +47,6 @@ impl ParsedEmdfPayloadData {
             Self::Joc(payload) => Some(payload.short_summary()),
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BedChannel {
-    FrontLeft,
-    FrontRight,
-    Center,
-    LowFrequencyEffects,
-    SurroundLeft,
-    SurroundRight,
-    RearLeft,
-    RearRight,
-    TopFrontLeft,
-    TopFrontRight,
-    TopSurroundLeft,
-    TopSurroundRight,
-    TopRearLeft,
-    TopRearRight,
-    WideLeft,
-    WideRight,
-    LowFrequencyEffects2,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Vec3 {
-    pub x: f32,
-    pub y: f32,
-    pub z: f32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ObjectAnchor {
-    Room,
-    Screen,
-    Speaker,
 }
 
 #[derive(Debug, Clone, PartialEq)]

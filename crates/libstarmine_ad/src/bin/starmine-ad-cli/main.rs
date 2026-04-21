@@ -11,8 +11,12 @@ use std::time::Instant;
 
 use raw_eac3::RawEac3FrameIter;
 use starmine_ad::{
-    BedChannel, CorePcmFrame, Decoder, JocObjectMatrices, ObjectPcmDecoder, ObjectPcmFrame,
-    PcmDecoder, RENDER_714_CHANNEL_ORDER, Render714Frame, Render714TimeslotDebug, Renderer714,
+    eac3dec::{
+        CorePcmFrame, Decoder, JocObjectMatrices, ObjectPcmDecoder, ObjectPcmFrame, PcmDecoder,
+    },
+    renderer::{
+        BedChannel, RENDER_714_CHANNEL_ORDER, Render714Frame, Render714TimeslotDebug, Renderer714,
+    },
 };
 
 #[derive(Debug, Clone)]

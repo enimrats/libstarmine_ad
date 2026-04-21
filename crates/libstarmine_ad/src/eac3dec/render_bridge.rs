@@ -1,15 +1,9 @@
-use crate::metadata::{BedChannel, OamdPayload};
-use crate::pcm::{CorePcmFrame, ObjectPcmFrame};
-use crate::render::{Render714Error, Render714Frame, Render714TimeslotDebug, Renderer714};
-use crate::render_input::{RenderInputChannel, RenderInputFrame, RenderMetadataUpdate};
-
-/// Bridge from a codec-specific decoded frame into the renderer's codec-neutral IR.
-///
-/// New codecs should expose their own decoded frame type and implement this trait so they can be
-/// routed into [`Renderer714`] without teaching the renderer about codec internals.
-pub trait RenderFrameSource {
-    fn to_render_input(&self) -> RenderInputFrame;
-}
+use super::metadata::{OamdElementKind, OamdObjectBlock, OamdPayload};
+use super::pcm::{CorePcmFrame, ObjectPcmFrame};
+use crate::renderer::{
+    BedChannel, RenderFrameSource, RenderInputChannel, RenderInputFrame, RenderMetadata,
+    RenderMetadataBlockUpdate, RenderMetadataElement, RenderMetadataObject, RenderMetadataUpdate,
+};
 
 pub(crate) fn render_input_from_eac3_parts(
     core: &CorePcmFrame,
@@ -69,31 +63,78 @@ impl RenderFrameSource for ObjectPcmFrame {
     }
 }
 
-impl Renderer714 {
-    /// Render any decoded frame that implements the shared decoder-to-renderer bridge.
-    pub fn push_source_frame(
-        &mut self,
-        source: &impl RenderFrameSource,
-    ) -> Result<Render714Frame, Render714Error> {
-        let input = source.to_render_input();
-        self.push_frame(&input)
+impl RenderMetadataUpdate {
+    pub fn from_oamd_payload(payload: &OamdPayload, sample_offset: Option<u16>) -> Self {
+        Self {
+            sample_offset: sample_offset.unwrap_or_default(),
+            metadata: RenderMetadata::from(payload),
+        }
     }
+}
 
-    /// Like [`Self::push_source_frame`], but also returns per-timeslot debug state.
-    pub fn push_source_frame_with_debug(
-        &mut self,
-        source: &impl RenderFrameSource,
-    ) -> Result<(Render714Frame, Vec<Render714TimeslotDebug>), Render714Error> {
-        let input = source.to_render_input();
-        self.push_frame_with_debug(&input)
+impl From<&OamdObjectBlock> for RenderMetadataObject {
+    fn from(block: &OamdObjectBlock) -> Self {
+        Self {
+            gain: block.gain,
+            anchor: block.anchor,
+            position_valid: block.valid_position,
+            differential_position: block.differential_position,
+            position: block.position,
+            distance: block.distance,
+            size: block.size,
+            screen_factor: block.screen_factor.unwrap_or(1.0),
+            depth_factor: block.depth_factor.unwrap_or(1.0),
+        }
+    }
+}
+
+impl From<&OamdPayload> for RenderMetadata {
+    fn from(payload: &OamdPayload) -> Self {
+        let bed_channels = payload
+            .bed_assignment
+            .iter()
+            .flat_map(|instance| instance.iter().copied())
+            .collect();
+        let elements = payload
+            .elements
+            .iter()
+            .filter_map(|element| {
+                let OamdElementKind::Object(object_element) = &element.kind else {
+                    return None;
+                };
+
+                Some(RenderMetadataElement {
+                    block_updates: object_element
+                        .block_updates
+                        .iter()
+                        .map(|update| RenderMetadataBlockUpdate {
+                            offset: i64::from(update.offset),
+                            ramp_duration: i64::from(update.ramp_duration),
+                        })
+                        .collect(),
+                    object_blocks: object_element
+                        .object_blocks
+                        .iter()
+                        .map(|blocks| blocks.iter().map(RenderMetadataObject::from).collect())
+                        .collect(),
+                })
+            })
+            .collect();
+
+        Self {
+            object_count: payload.object_count,
+            bed_or_isf_objects: payload.bed_or_isf_objects,
+            bed_channels,
+            elements,
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{RenderFrameSource, render_input_from_eac3_parts};
-    use crate::metadata::{BedChannel, JocPayload, OamdPayload};
-    use crate::pcm::{CorePcmFrame, ObjectPcmFrame};
+    use super::render_input_from_eac3_parts;
+    use crate::eac3dec::{CorePcmFrame, JocPayload, OamdPayload, ObjectPcmFrame};
+    use crate::renderer::{BedChannel, RenderFrameSource};
 
     fn bed_payload(channel: BedChannel) -> OamdPayload {
         OamdPayload {

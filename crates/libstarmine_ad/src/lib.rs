@@ -1,17 +1,12 @@
 //! Stateful E-AC-3 object-audio decoding and 7.1.4 rendering.
 //!
-//! The crate is organized as a small pipeline. Pick the highest layer you need:
+//! The crate is split into two main namespaces:
 //!
-//! - [`inspect_access_unit`] validates a single complete access unit and returns parsed
-//!   syncframe / EMDF / payload metadata.
-//! - [`Decoder`] does the same thing statefully across frames and keeps cross-frame metadata
-//!   state in sync.
-//! - [`PcmDecoder`] adds decoded E-AC-3 core PCM channels.
-//! - [`ObjectPcmDecoder`] adds decoded E-AC-3/JOC object PCM plus parsed E-AC-3 metadata payloads.
-//! - [`RenderInputFrame`] is the codec-neutral decoder-to-renderer contract.
-//! - [`RenderFrameSource`] and `to_render_input()` are the explicit adapter seam between a codec
-//!   decoder and the renderer.
-//! - [`Renderer714`] turns [`RenderInputFrame`] values into 7.1.4 float PCM.
+//! - [`eac3dec`] contains the E-AC-3/JOC/OAMD parser and decoder pipeline.
+//! - [`renderer`] contains the codec-neutral render contract and the stateful 7.1.4 renderer.
+//!
+//! The explicit seam between them is [`renderer::RenderInputFrame`] /
+//! [`renderer::RenderFrameSource`].
 //!
 //! All decoders are stateful. Feed complete access units in stream order and call `reset()` after
 //! seeks, discontinuities, or when you intentionally drop intermediate packets.
@@ -20,7 +15,7 @@
 //!
 //! ```no_run
 //! use std::fs;
-//! use starmine_ad::{ObjectPcmDecoder, Renderer714};
+//! use starmine_ad::{eac3dec::ObjectPcmDecoder, renderer::Renderer714};
 //!
 //! let access_unit = fs::read("frame.eac3")?;
 //! let mut decoder = ObjectPcmDecoder::new();
@@ -45,46 +40,12 @@
 //! # C Integration
 //!
 //! A C ABI is provided through [starmine_ad.h](../../include/starmine_ad.h). The header exposes
-//! both the low-level [`Decoder`] entry point and a stateful 7.1.4 rendering path: create either
-//! a decoder handle or a renderer handle, push one complete access unit at a time, read a copied
-//! [`AccessUnitInfo`]-style summary, and reset the handle when the stream position jumps. The
-//! render path exports borrowed planar `float` pointers whose lifetime is tied to the renderer
-//! handle. A libav-based end-to-end C example lives under `Starmine_ad/examples/`.
+//! both the low-level [`eac3dec::Decoder`] entry point and a stateful 7.1.4 rendering path:
+//! create either a decoder handle or a renderer handle, push one complete access unit at a time,
+//! read a copied [`eac3dec::AccessUnitInfo`]-style summary, and reset the handle when the stream
+//! position jumps. The render path exports borrowed planar `float` pointers whose lifetime is tied
+//! to the renderer handle. A libav-based end-to-end C example lives under `Starmine_ad/examples/`.
 
-mod adapter;
-mod allocation;
-mod bitstream;
-mod decoder;
+pub mod eac3dec;
 mod ffi;
-mod imdct;
-mod joc;
-mod metadata;
-mod pcm;
-mod qmf;
-mod render;
-mod render_input;
-mod syncframe;
-
-pub use adapter::RenderFrameSource;
-pub use decoder::{Decoder, PushResult};
-pub use joc::{JocObjectMatrices, JocSubbandMatrix, JocTimeslotMatrices};
-pub use metadata::{
-    BedChannel, JocObject, JocObjectData, JocPayload, OamdBlockUpdate, OamdElement,
-    OamdElementKind, OamdObjectBlock, OamdObjectElement, OamdPayload, ObjectAnchor,
-    ParsedEmdfPayloadData, ParsedEmdfPayloadKind, Vec3,
-};
-pub use pcm::{
-    CorePcmFrame, ObjectPcmDecoder, ObjectPcmFrame, ObjectPcmPushResult, PcmDecoder, PcmPushResult,
-};
-pub use render::{
-    RENDER_714_CHANNEL_ORDER, Render714Error, Render714Frame, Render714SourceDebug,
-    Render714TimeslotDebug, Renderer714,
-};
-pub use render_input::{
-    RenderInputChannel, RenderInputFrame, RenderMetadata, RenderMetadataBlockUpdate,
-    RenderMetadataElement, RenderMetadataObject, RenderMetadataUpdate,
-};
-pub use syncframe::{
-    AccessUnitInfo, AuxParseStatus, EmdfBlockInfo, EmdfPayloadInfo, FrameType, ParseError,
-    PayloadInfo, SkipFieldInfo, inspect_access_unit,
-};
+pub mod renderer;

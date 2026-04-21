@@ -1,4 +1,4 @@
-use starmine_ad::{ParseError, inspect_access_unit};
+use starmine_ad::eac3dec::{ParseError, inspect_access_unit};
 
 pub struct RawEac3Frame<'a> {
     pub offset: usize,

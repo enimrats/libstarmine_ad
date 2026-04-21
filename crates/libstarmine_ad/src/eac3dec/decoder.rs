@@ -1,5 +1,5 @@
-use crate::metadata::MetadataParseState;
-use crate::syncframe::{AccessUnitInfo, ParseError, inspect_access_unit_with_metadata_state};
+use super::metadata::MetadataParseState;
+use super::syncframe::{AccessUnitInfo, ParseError, inspect_access_unit_with_metadata_state};
 
 #[derive(Debug, Clone, PartialEq)]
 /// Result returned by [`Decoder::push_access_unit`].

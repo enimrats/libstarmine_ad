@@ -6,17 +6,18 @@
 
 use std::fmt;
 
-use crate::allocation::{
+use super::allocation::{
     AllocationState, BitAllocationParams, DeltaBitAllocationMode, DeltaBitAllocationState,
     LFE_END_MANTISSA, MantissaDecodeState, MantissaGroupState, grouped_exponent_count,
     sample_rate_index,
 };
-use crate::bitstream::BitReader;
-use crate::imdct::ImdctState;
-use crate::metadata::{
-    BedChannel, MetadataParseState, ParsedEmdfPayloadData, parse_emdf_payload_body_with_state,
+use super::bitstream::BitReader;
+use super::imdct::ImdctState;
+use super::metadata::{
+    MetadataParseState, ParsedEmdfPayloadData, parse_emdf_payload_body_with_state,
 };
-use crate::pcm::CorePcmFrame;
+use super::pcm::CorePcmFrame;
+use crate::renderer::BedChannel;
 
 const EAC3_BLOCKS: [u8; 4] = [1, 2, 3, 6];
 const AC3_SAMPLE_RATES: [u32; 3] = [48_000, 44_100, 32_000];
@@ -589,7 +590,7 @@ impl CoreDecodeState {
 /// Parse one complete access unit without keeping any cross-frame state.
 ///
 /// Use this helper for one-off inspection, tests, or tools that already manage stream boundaries
-/// externally. Stateful callers should prefer [`crate::Decoder`].
+/// externally. Stateful callers should prefer [`crate::eac3dec::Decoder`].
 pub fn inspect_access_unit(data: &[u8]) -> Result<AccessUnitInfo, ParseError> {
     let mut metadata_state = MetadataParseState::default();
     inspect_access_unit_with_metadata_state(data, &mut metadata_state)

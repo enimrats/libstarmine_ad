@@ -1,8 +1,8 @@
-use crate::metadata::{BedChannel, ObjectAnchor, Vec3};
-use crate::render_input::{
+use super::render_input::{
     RenderInputFrame, RenderMetadata, RenderMetadataElement, RenderMetadataObject,
     RenderMetadataUpdate,
 };
+use super::types::{BedChannel, ObjectAnchor, Vec3};
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::{
     vabsq_f32, vdupq_n_f32, vfmaq_f32, vld1q_f32, vmaxq_f32, vmaxvq_f32, vmulq_f32, vst1q_f32,
@@ -1960,11 +1960,11 @@ mod tests {
         RenderInputFrame, RenderMetadataUpdate, Renderer714, apply_output_limiter,
         map_bed_channel_to_714, mix_bed_objects_to_714, render_object_timeslot_to_714,
     };
-    use crate::metadata::{
-        BedChannel, OamdBlockUpdate, OamdElement, OamdElementKind, OamdObjectBlock,
-        OamdObjectElement, OamdPayload, Vec3,
+    use crate::eac3dec::{
+        OamdBlockUpdate, OamdElement, OamdElementKind, OamdObjectBlock, OamdObjectElement,
+        OamdPayload,
     };
-    use crate::render_input::{RenderInputChannel, RenderMetadata};
+    use crate::renderer::{BedChannel, RenderInputChannel, RenderMetadata, Vec3};
 
     fn concat_rendered_frames(frames: &[Render714Frame]) -> Vec<Vec<f32>> {
         let mut merged = vec![Vec::new(); RENDER_714_CHANNELS];

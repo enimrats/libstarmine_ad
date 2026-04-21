@@ -2,10 +2,11 @@
 
 use std::sync::OnceLock;
 
-use crate::metadata::{BedChannel, JocObject, JocObjectData, JocPayload};
-use crate::pcm::CorePcmFrame;
-use crate::qmf::{QMF_SUBBANDS, QmfSubbands, QuadratureMirrorFilterBank};
-use crate::syncframe::ParseError;
+use super::metadata::{JocObject, JocObjectData, JocPayload};
+use super::pcm::CorePcmFrame;
+use super::qmf::{QMF_SUBBANDS, QmfSubbands, QuadratureMirrorFilterBank};
+use super::syncframe::ParseError;
+use crate::renderer::BedChannel;
 
 const JOC_INPUT_ORDER: [BedChannel; 7] = [
     BedChannel::FrontLeft,
@@ -530,8 +531,8 @@ mod tests {
         build_object_timeslots, decode_parameter_points, expanded_parameter_band_mapping,
         map_input_channel_indices,
     };
-    use crate::metadata::{BedChannel, JocObject, JocObjectData};
-    use crate::pcm::CorePcmFrame;
+    use crate::eac3dec::{CorePcmFrame, JocObject, JocObjectData};
+    use crate::renderer::BedChannel;
 
     #[test]
     fn parameter_band_mapping_expands_last_band() {

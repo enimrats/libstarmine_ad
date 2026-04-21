@@ -2,7 +2,7 @@
 
 use std::sync::OnceLock;
 
-use crate::syncframe::{ExpStrategy, ParseError};
+use super::syncframe::{ExpStrategy, ParseError};
 
 pub(crate) const LFE_END_MANTISSA: usize = 7;
 const MAX_ALLOCATION_SIZE: usize = 256;
@@ -125,7 +125,7 @@ impl Default for DeltaBitAllocationState {
 impl DeltaBitAllocationState {
     pub(crate) fn read_segments(
         &mut self,
-        reader: &mut crate::bitstream::BitReader<'_>,
+        reader: &mut super::bitstream::BitReader<'_>,
     ) -> Result<(), ParseError> {
         let segments = reader.read_bits(3).ok_or(ParseError::ShortPacket)? as usize + 1;
         self.offsets.clear();
@@ -197,7 +197,7 @@ impl AllocationState {
 
     pub(crate) fn read_channel_exponents(
         &mut self,
-        reader: &mut crate::bitstream::BitReader<'_>,
+        reader: &mut super::bitstream::BitReader<'_>,
         strategy: ExpStrategy,
         groups: usize,
         end_mantissa: usize,
@@ -225,7 +225,7 @@ impl AllocationState {
 
     pub(crate) fn read_lfe_exponents(
         &mut self,
-        reader: &mut crate::bitstream::BitReader<'_>,
+        reader: &mut super::bitstream::BitReader<'_>,
     ) -> Result<(), ParseError> {
         let absolute_exponent = reader.read_bits(4).ok_or(ParseError::ShortPacket)? as i32;
         self.grouped_scratch.clear();
@@ -415,7 +415,7 @@ impl AllocationState {
 
     pub(crate) fn decode_transform_coeffs(
         &self,
-        reader: &mut crate::bitstream::BitReader<'_>,
+        reader: &mut super::bitstream::BitReader<'_>,
         target: &mut [f32; MAX_ALLOCATION_SIZE],
         start: usize,
         end: usize,

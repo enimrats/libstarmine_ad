@@ -1,15 +1,14 @@
-use crate::adapter::render_input_from_eac3_parts;
 use std::ffi::c_char;
 use std::ptr;
 use std::slice;
 
-use crate::joc::JocObjectDecoderState;
-use crate::metadata::{BedChannel, MetadataParseState, ParsedEmdfPayloadData};
-use crate::syncframe::{
-    AccessUnitInfo, CoreDecodeState, ParseError, decode_core_pcm_frame_with_state_into,
-    inspect_access_unit_with_metadata_state,
+use crate::eac3dec::{
+    AccessUnitInfo, CoreDecodeState, CorePcmFrame, Decoder, FrameType, JocObjectDecoderState,
+    MetadataParseState, ParseError, ParsedEmdfPayloadData, PushResult,
+    decode_core_pcm_frame_with_state_into, inspect_access_unit_with_metadata_state,
+    render_input_from_eac3_parts,
 };
-use crate::{CorePcmFrame, Decoder, PushResult, Render714Error, Render714Frame, Renderer714};
+use crate::renderer::{BedChannel, Render714Error, Render714Frame, Renderer714};
 
 const STARMINE_AD_RENDER_714_CHANNELS: usize = 12;
 
@@ -181,7 +180,7 @@ impl StarmineAdStatus {
 #[cfg(test)]
 mod tests {
     use super::{StarmineAdStatus, starmine_ad_status_string};
-    use crate::Render714Error;
+    use crate::renderer::Render714Error;
     use std::ffi::CStr;
 
     #[test]
@@ -227,9 +226,9 @@ impl StarmineAdAccessUnitInfo {
             frame_size: *frame_size as u32,
             bitstream_id: *bitstream_id,
             frame_type: match frame_type {
-                crate::FrameType::Independent => 0,
-                crate::FrameType::Dependent => 1,
-                crate::FrameType::Ac3Convert => 2,
+                FrameType::Independent => 0,
+                FrameType::Dependent => 1,
+                FrameType::Ac3Convert => 2,
             },
             substreamid: *substreamid,
             sample_rate: *sample_rate,

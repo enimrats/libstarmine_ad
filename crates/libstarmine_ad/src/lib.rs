@@ -3,6 +3,7 @@
 //! The crate is split into two main namespaces:
 //!
 //! - [`eac3dec`] contains the E-AC-3/JOC/OAMD parser and decoder pipeline.
+//! - [`truehddec`] contains the Dolby TrueHD/Atmos parser and decoder bridge.
 //! - [`renderer`] contains the codec-neutral render contract and the stateful 7.1.4 renderer.
 //!
 //! The explicit seam between them is [`renderer::RenderInputFrame`] /
@@ -49,3 +50,4 @@
 pub mod eac3dec;
 mod ffi;
 pub mod renderer;
+pub mod truehddec;

@@ -12,10 +12,15 @@ use std::time::Instant;
 use raw_eac3::RawEac3FrameIter;
 use starmine_ad::{
     eac3dec::{
-        CorePcmFrame, Decoder, JocObjectMatrices, ObjectPcmDecoder, ObjectPcmFrame, PcmDecoder,
+        CorePcmFrame, Decoder, JocObjectMatrices, ObjectPcmDecoder,
+        ObjectPcmFrame as Eac3ObjectPcmFrame, PcmDecoder,
     },
     renderer::{
         BedChannel, RENDER_714_CHANNEL_ORDER, Render714Frame, Render714TimeslotDebug, Renderer714,
+    },
+    truehddec::{
+        BitstreamObjectPcmDecoder as TrueHdBitstreamObjectPcmDecoder,
+        ObjectPcmFrame as TrueHdObjectPcmFrame,
     },
 };
 
@@ -86,12 +91,15 @@ impl ProgressStats {
     }
 
     fn record_access_unit(&mut self, sample_rate: u32, num_blocks: u8) {
-        if sample_rate == 0 || num_blocks == 0 {
+        self.record_samples(sample_rate, usize::from(num_blocks) * 256);
+    }
+
+    fn record_samples(&mut self, sample_rate: u32, samples: usize) {
+        if sample_rate == 0 || samples == 0 {
             return;
         }
 
-        self.processed_audio_seconds +=
-            (usize::from(num_blocks) * 256) as f64 / f64::from(sample_rate);
+        self.processed_audio_seconds += samples as f64 / f64::from(sample_rate);
     }
 
     fn format_status(&self) -> String {
@@ -205,7 +213,7 @@ impl ObjectDumpWriter {
         })
     }
 
-    fn write_frame(&mut self, frame: &ObjectPcmFrame) -> Result<Option<String>, String> {
+    fn write_frame(&mut self, frame: &Eac3ObjectPcmFrame) -> Result<Option<String>, String> {
         let object_count = frame.object_count();
         let first_summary = if self.sample_rate.is_none() {
             self.sample_rate = Some(frame.core.sample_rate);
@@ -229,6 +237,49 @@ impl ObjectDumpWriter {
                     self.path.display(),
                     self.sample_rate.unwrap_or_default(),
                     frame.core.sample_rate,
+                ));
+            }
+            if self.object_count != Some(object_count) {
+                return Err(format!(
+                    "object PCM object count changed mid-stream in {}: expected {} got {}",
+                    self.path.display(),
+                    self.object_count.unwrap_or_default(),
+                    object_count,
+                ));
+            }
+            None
+        };
+
+        for (index, channel) in frame.object_channels.iter().enumerate() {
+            let mut bytes = Vec::with_capacity(channel.len() * std::mem::size_of::<f32>());
+            for sample in channel {
+                bytes.extend_from_slice(&sample.to_le_bytes());
+            }
+            self.files[index]
+                .write_all(&bytes)
+                .map_err(|err| format!("failed to write {}: {err}", self.path.display()))?;
+        }
+
+        Ok(first_summary)
+    }
+
+    fn write_truehd_frame(
+        &mut self,
+        frame: &TrueHdObjectPcmFrame,
+    ) -> Result<Option<String>, String> {
+        let object_count = frame.object_count();
+        let first_summary = if self.sample_rate.is_none() {
+            self.sample_rate = Some(frame.sample_rate);
+            self.object_count = Some(object_count);
+            self.ensure_files(object_count)?;
+            Some(format!("objects={object_count}"))
+        } else {
+            if self.sample_rate != Some(frame.sample_rate) {
+                return Err(format!(
+                    "object PCM sample rate changed mid-stream in {}: expected {} got {}",
+                    self.path.display(),
+                    self.sample_rate.unwrap_or_default(),
+                    frame.sample_rate,
                 ));
             }
             if self.object_count != Some(object_count) {
@@ -282,7 +333,7 @@ impl JocMatrixDumpWriter {
 
     fn write_frame(
         &mut self,
-        frame: &ObjectPcmFrame,
+        frame: &Eac3ObjectPcmFrame,
         matrices: &JocObjectMatrices,
     ) -> Result<Option<String>, String> {
         let object_count = matrices.len();
@@ -602,7 +653,7 @@ impl RenderPositionsCsvWriter {
 
 fn usage(program: &str) {
     eprintln!(
-        "usage: {program} <input.eac3|frame-dir> [--limit N] [--dump-frame-dir DIR] [--dump-aux-dir DIR] [--decode-core-check] [--dump-core-f32 PATH] [--decode-objects-check] [--dump-objects-f32 DIR] [--dump-joc-matrices-f32 DIR] [--render-714-check] [--dump-render-714-wav PATH] [--dump-render-positions-csv PATH]"
+        "usage: {program} <input.eac3|input.mlp|input.thd|frame-dir> [--limit N] [--dump-frame-dir DIR] [--dump-aux-dir DIR] [--decode-core-check] [--dump-core-f32 PATH] [--decode-objects-check] [--dump-objects-f32 DIR] [--dump-joc-matrices-f32 DIR] [--render-714-check] [--dump-render-714-wav PATH] [--dump-render-positions-csv PATH]"
     );
 }
 
@@ -696,7 +747,7 @@ fn parse_args() -> Result<RunOptions, String> {
             dump_render_714_wav,
             dump_render_positions_csv,
         })
-        .ok_or("missing input.eac3 or frame-dir".to_string())
+        .ok_or("missing input.eac3, input.mlp, input.thd, or frame-dir".to_string())
 }
 
 fn write_frame(output_dir: &Path, index: usize, bytes: &[u8]) -> Result<PathBuf, String> {
@@ -773,6 +824,35 @@ fn bed_channel_name(channel: BedChannel) -> &'static str {
         BedChannel::WideRight => "WR",
         BedChannel::LowFrequencyEffects2 => "LFE2",
     }
+}
+
+fn is_truehd_input(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("mlp")
+                || extension.eq_ignore_ascii_case("thd")
+                || extension.eq_ignore_ascii_case("truehd")
+        })
+}
+
+fn validate_truehd_options(options: &RunOptions) -> Result<(), String> {
+    if options.dump_frame_dir.is_some() {
+        return Err("--dump-frame-dir is only valid for raw .eac3 input".to_string());
+    }
+    if options.dump_aux_dir.is_some() {
+        return Err("--dump-aux-dir is not supported for raw TrueHD input".to_string());
+    }
+    if options.decode_core_check {
+        return Err("--decode-core-check is not supported for raw TrueHD input".to_string());
+    }
+    if options.dump_core_f32.is_some() {
+        return Err("--dump-core-f32 is not supported for raw TrueHD input".to_string());
+    }
+    if options.dump_joc_matrices_f32.is_some() {
+        return Err("--dump-joc-matrices-f32 is only valid for E-AC-3/JOC input".to_string());
+    }
+    Ok(())
 }
 
 fn process_raw_eac3(input: &Path, bytes: &[u8], options: &RunOptions) -> ExitCode {
@@ -1166,6 +1246,239 @@ fn process_raw_eac3(input: &Path, bytes: &[u8], options: &RunOptions) -> ExitCod
     }
 
     println!("frames_dumped={} {}", frames, progress.format_status());
+    ExitCode::SUCCESS
+}
+
+fn process_raw_truehd(input: &Path, bytes: &[u8], options: &RunOptions) -> ExitCode {
+    if let Err(err) = validate_truehd_options(options) {
+        eprintln!("{err}");
+        return ExitCode::FAILURE;
+    }
+
+    let use_render_714 = options.render_714_check
+        || options.dump_render_714_wav.is_some()
+        || options.dump_render_positions_csv.is_some();
+    let mut object_decoder = TrueHdBitstreamObjectPcmDecoder::new();
+    let mut renderer_714 = Renderer714::new();
+    let mut object_dump_writer = match options.dump_objects_f32.as_deref() {
+        Some(path) => match ObjectDumpWriter::create(path) {
+            Ok(writer) => Some(writer),
+            Err(err) => {
+                eprintln!("{err}");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => None,
+    };
+    let mut render_714_writer = match options.dump_render_714_wav.as_deref() {
+        Some(path) => match Render714WavWriter::create(path) {
+            Ok(writer) => Some(writer),
+            Err(err) => {
+                eprintln!("{err}");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => None,
+    };
+    let mut render_positions_writer = match options.dump_render_positions_csv.as_deref() {
+        Some(path) => match RenderPositionsCsvWriter::create(path) {
+            Ok(writer) => Some(writer),
+            Err(err) => {
+                eprintln!("{err}");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => None,
+    };
+    let mut frames = 0usize;
+    let mut progress = ProgressStats::new();
+    let mut rendered_output_samples = 0usize;
+
+    println!(
+        "input={} mode=raw-truehd bytes={} limit={} decode_objects=1 dump_objects_f32={} render_714={} dump_render_714_wav={} dump_render_positions_csv={}",
+        input.display(),
+        bytes.len(),
+        options
+            .limit
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "all".to_string()),
+        options
+            .dump_objects_f32
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "-".to_string()),
+        if use_render_714 { 1 } else { 0 },
+        options
+            .dump_render_714_wav
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "-".to_string()),
+        options
+            .dump_render_positions_csv
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "-".to_string()),
+    );
+
+    'chunks: for chunk in bytes.chunks(32 * 1024) {
+        let results = match object_decoder.push_bytes(chunk) {
+            Ok(results) => results,
+            Err(err) => {
+                eprintln!("truehd decoder error after {} frames: {err}", frames);
+                return ExitCode::FAILURE;
+            }
+        };
+
+        for result in results {
+            let (render_714, render_debug) = if use_render_714 {
+                let render_input = result.pcm.to_render_input();
+                if render_positions_writer.is_some() {
+                    match renderer_714.push_frame_with_debug(&render_input) {
+                        Ok((rendered, debug)) => (Some(rendered), Some(debug)),
+                        Err(err) => {
+                            eprintln!("render 7.1.4 error on frame {}: {err}", frames);
+                            return ExitCode::FAILURE;
+                        }
+                    }
+                } else {
+                    match renderer_714.push_frame(&render_input) {
+                        Ok(rendered) => (Some(rendered), None),
+                        Err(err) => {
+                            eprintln!("render 7.1.4 error on frame {}: {err}", frames);
+                            return ExitCode::FAILURE;
+                        }
+                    }
+                }
+            } else {
+                (None, None)
+            };
+
+            progress.record_samples(result.pcm.sample_rate, result.pcm.samples_per_channel());
+            let progress_status = progress.format_status();
+
+            println!(
+                "frame={} access_units_seen={} frames_seen={} {} truehd sample_rate={} bedpcm={}s/{}ch objectpcm={}obj metadata_updates={}{}",
+                frames,
+                result.access_units_seen,
+                result.frames_seen,
+                progress_status,
+                result.pcm.sample_rate,
+                result.pcm.samples_per_channel(),
+                result.pcm.bed_channel_count(),
+                result.pcm.object_count(),
+                result.pcm.metadata_updates.len(),
+                render_714
+                    .as_ref()
+                    .map(|rendered| format!(
+                        " render714={}s/{}ch",
+                        rendered.samples_per_channel(),
+                        rendered.channel_count()
+                    ))
+                    .unwrap_or_default(),
+            );
+
+            if let Some(writer) = object_dump_writer.as_mut() {
+                match writer.write_truehd_frame(&result.pcm) {
+                    Ok(Some(summary)) => println!(
+                        "objectpcm_summary={} sample_rate={} path={}",
+                        summary,
+                        result.pcm.sample_rate,
+                        writer.path.display(),
+                    ),
+                    Ok(None) => {}
+                    Err(err) => {
+                        eprintln!("{err}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+
+            if let Some(rendered) = render_714.as_ref() {
+                if let Some(writer) = render_714_writer.as_mut() {
+                    match writer.write_frame(rendered) {
+                        Ok(Some(layout)) => println!(
+                            "render714_layout={} sample_rate={} path={}",
+                            layout,
+                            rendered.sample_rate,
+                            writer.path.display(),
+                        ),
+                        Ok(None) => {}
+                        Err(err) => {
+                            eprintln!("{err}");
+                            return ExitCode::FAILURE;
+                        }
+                    }
+                }
+
+                if let (Some(writer), Some(debug)) =
+                    (render_positions_writer.as_mut(), render_debug.as_deref())
+                {
+                    match writer.write_timeslots(rendered_output_samples, debug) {
+                        Ok(Some(summary)) => println!(
+                            "render714_positions_summary={} sample_rate={} path={}",
+                            summary,
+                            rendered.sample_rate,
+                            writer.path.display(),
+                        ),
+                        Ok(None) => {}
+                        Err(err) => {
+                            eprintln!("{err}");
+                            return ExitCode::FAILURE;
+                        }
+                    }
+                }
+
+                rendered_output_samples += rendered.samples_per_channel();
+            }
+
+            frames += 1;
+            if options.limit.is_some_and(|limit| frames >= limit) {
+                break 'chunks;
+            }
+        }
+    }
+
+    if use_render_714 {
+        if render_positions_writer.is_some() {
+            if let Some((rendered, debug)) = renderer_714.flush_with_debug() {
+                if let Some(writer) = render_714_writer.as_mut() {
+                    if let Err(err) = writer.write_frame(&rendered) {
+                        eprintln!("{err}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+                if let Some(writer) = render_positions_writer.as_mut() {
+                    if let Err(err) = writer.write_timeslots(rendered_output_samples, &debug) {
+                        eprintln!("{err}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+                rendered_output_samples += rendered.samples_per_channel();
+            }
+        } else if let Some(rendered) = renderer_714.flush() {
+            if let Some(writer) = render_714_writer.as_mut() {
+                if let Err(err) = writer.write_frame(&rendered) {
+                    eprintln!("{err}");
+                    return ExitCode::FAILURE;
+                }
+            }
+            rendered_output_samples += rendered.samples_per_channel();
+        }
+    }
+
+    if let Some(writer) = render_714_writer.as_mut() {
+        if let Err(err) = writer.finalize() {
+            eprintln!("{err}");
+            return ExitCode::FAILURE;
+        }
+    }
+
+    println!(
+        "frames_dumped={} rendered_samples={} {}",
+        frames,
+        rendered_output_samples,
+        progress.format_status(),
+    );
     ExitCode::SUCCESS
 }
 
@@ -1579,5 +1892,9 @@ fn main() -> ExitCode {
         }
     };
 
-    process_raw_eac3(&options.input, &bytes, &options)
+    if is_truehd_input(&options.input) {
+        process_raw_truehd(&options.input, &bytes, &options)
+    } else {
+        process_raw_eac3(&options.input, &bytes, &options)
+    }
 }

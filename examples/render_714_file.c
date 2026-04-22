@@ -42,6 +42,7 @@ struct wav_writer {
     size_t channel_count;
     uint64_t data_bytes;
     bool initialized;
+    bool streaming;
 };
 
 struct progress_stats {
@@ -51,7 +52,8 @@ struct progress_stats {
 
 static void usage(const char *argv0) {
     fprintf(stderr,
-            "usage: %s <input> <output.wav> [--stream-index N] [--limit N]\n",
+            "usage: %s <input> <output.wav|-> [--stream-index N] [--limit N]\n"
+            "       use '-' to stream WAV to stdout\n",
             argv0);
 }
 
@@ -198,13 +200,20 @@ static const char *bed_channel_name(starmine_ad_bed_channel channel) {
     }
 }
 
-static void print_channel_order(const starmine_ad_render_714_frame *frame) {
-    printf("render714_layout=");
+static FILE *status_file_for_output(const char *output) {
+    if (output && strcmp(output, "-") == 0)
+        return stderr;
+    return stdout;
+}
+
+static void print_channel_order(FILE *log,
+                                const starmine_ad_render_714_frame *frame) {
+    fprintf(log, "render714_layout=");
     for (size_t i = 0; i < frame->channel_count; i++) {
-        printf("%s%s", i == 0 ? "" : ",",
-               bed_channel_name(frame->channel_order[i]));
+        fprintf(log, "%s%s", i == 0 ? "" : ",",
+                bed_channel_name(frame->channel_order[i]));
     }
-    printf("\n");
+    fprintf(log, "\n");
 }
 
 static bool write_bytes(FILE *file, const void *data, size_t len) {
@@ -248,9 +257,55 @@ static bool truehd_packet_is_single_access_unit(const uint8_t *data,
     return access_unit_len != 0 && access_unit_len == len;
 }
 
+static bool wav_writer_write_header(struct wav_writer *writer, uint32_t riff_size,
+                                    uint32_t data_size) {
+    static const unsigned char ieee_float_subformat[16] = {
+        0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00,
+        0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71,
+    };
+    uint16_t channel_count = 0;
+    uint16_t bits_per_sample = 32;
+    uint16_t block_align = 0;
+    uint32_t byte_rate = 0;
+
+    if (!writer || !writer->file)
+        return false;
+    if (writer->channel_count > UINT16_MAX)
+        return false;
+
+    channel_count = (uint16_t)writer->channel_count;
+    block_align = (uint16_t)(channel_count * sizeof(float));
+    byte_rate = writer->sample_rate * (uint32_t)block_align;
+
+    return write_bytes(writer->file, "RIFF", 4) &&
+           write_u32_le(writer->file, riff_size) &&
+           write_bytes(writer->file, "WAVE", 4) &&
+           write_bytes(writer->file, "fmt ", 4) &&
+           write_u32_le(writer->file, 40) &&
+           write_u16_le(writer->file, 0xfffe) &&
+           write_u16_le(writer->file, channel_count) &&
+           write_u32_le(writer->file, writer->sample_rate) &&
+           write_u32_le(writer->file, byte_rate) &&
+           write_u16_le(writer->file, block_align) &&
+           write_u16_le(writer->file, bits_per_sample) &&
+           write_u16_le(writer->file, 22) &&
+           write_u16_le(writer->file, bits_per_sample) &&
+           write_u32_le(writer->file, WAV_CHANNEL_MASK_714) &&
+           write_bytes(writer->file, ieee_float_subformat,
+                       sizeof(ieee_float_subformat)) &&
+           write_bytes(writer->file, "data", 4) &&
+           write_u32_le(writer->file, data_size);
+}
+
 static bool wav_writer_open(struct wav_writer *writer, const char *path) {
     memset(writer, 0, sizeof(*writer));
     writer->path = path;
+    if (strcmp(path, "-") == 0) {
+        writer->file = stdout;
+        writer->streaming = true;
+        return true;
+    }
+
     writer->file = fopen(path, "wb");
     if (!writer->file) {
         fprintf(stderr, "failed to open output '%s'\n", path);
@@ -270,11 +325,22 @@ static bool wav_writer_write_frame(struct wav_writer *writer,
                 STARMINE_AD_RENDER_714_CHANNEL_COUNT, frame->channel_count);
         return false;
     }
+    if (frame->channel_count > UINT16_MAX) {
+        fprintf(stderr, "channel count is too large for WAV: %zu\n",
+                frame->channel_count);
+        return false;
+    }
 
     if (!writer->initialized) {
         writer->sample_rate = frame->sample_rate;
         writer->channel_count = frame->channel_count;
-        if (fseek(writer->file, WAV_HEADER_SIZE, SEEK_SET) != 0) {
+        if (writer->streaming) {
+            if (!wav_writer_write_header(writer, UINT32_MAX, UINT32_MAX)) {
+                fprintf(stderr, "failed to write WAV header '%s'\n",
+                        writer->path);
+                return false;
+            }
+        } else if (fseek(writer->file, WAV_HEADER_SIZE, SEEK_SET) != 0) {
             fprintf(stderr, "failed to seek '%s'\n", writer->path);
             return false;
         }
@@ -303,18 +369,15 @@ static bool wav_writer_write_frame(struct wav_writer *writer,
         }
     }
 
+    if (writer->streaming && fflush(writer->file) != 0) {
+        fprintf(stderr, "failed to flush '%s'\n", writer->path);
+        return false;
+    }
+
     return true;
 }
 
 static bool wav_writer_finalize(struct wav_writer *writer) {
-    static const unsigned char ieee_float_subformat[16] = {
-        0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00,
-        0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71,
-    };
-    uint16_t channel_count = 0;
-    uint16_t bits_per_sample = 32;
-    uint16_t block_align = 0;
-    uint32_t byte_rate = 0;
     uint32_t riff_size = 0;
     uint32_t data_size = 0;
 
@@ -322,6 +385,24 @@ static bool wav_writer_finalize(struct wav_writer *writer) {
         return true;
     if (!writer->initialized)
         return true;
+    if (writer->streaming) {
+        if (fflush(writer->file) != 0) {
+            fprintf(stderr, "failed to flush '%s'\n", writer->path);
+            return false;
+        }
+        if (fseek(writer->file, 0, SEEK_SET) != 0) {
+            /* stdout can be a pipe/tty; keep placeholder sizes in that case. */
+            if (errno == ESPIPE)
+                return true;
+            fprintf(stderr, "failed to seek '%s'\n", writer->path);
+            return false;
+        }
+    } else {
+        if (fseek(writer->file, 0, SEEK_SET) != 0) {
+            fprintf(stderr, "failed to seek '%s'\n", writer->path);
+            return false;
+        }
+    }
     if (writer->channel_count > UINT16_MAX) {
         fprintf(stderr, "channel count is too large for WAV: %zu\n",
                 writer->channel_count);
@@ -332,9 +413,6 @@ static bool wav_writer_finalize(struct wav_writer *writer) {
         return false;
     }
 
-    channel_count = (uint16_t)writer->channel_count;
-    block_align = (uint16_t)(channel_count * sizeof(float));
-    byte_rate = writer->sample_rate * (uint32_t)block_align;
     data_size = (uint32_t)writer->data_bytes;
     if (writer->data_bytes > UINT32_MAX - (WAV_HEADER_SIZE - 8)) {
         fprintf(stderr, "RIFF chunk is too large for '%s'\n", writer->path);
@@ -342,30 +420,12 @@ static bool wav_writer_finalize(struct wav_writer *writer) {
     }
     riff_size = (uint32_t)(writer->data_bytes + (WAV_HEADER_SIZE - 8));
 
-    if (fseek(writer->file, 0, SEEK_SET) != 0) {
-        fprintf(stderr, "failed to seek '%s'\n", writer->path);
+    if (!wav_writer_write_header(writer, riff_size, data_size)) {
+        fprintf(stderr, "failed to write WAV header '%s'\n", writer->path);
         return false;
     }
-
-    if (!write_bytes(writer->file, "RIFF", 4) ||
-        !write_u32_le(writer->file, riff_size) ||
-        !write_bytes(writer->file, "WAVE", 4) ||
-        !write_bytes(writer->file, "fmt ", 4) ||
-        !write_u32_le(writer->file, 40) ||
-        !write_u16_le(writer->file, 0xfffe) ||
-        !write_u16_le(writer->file, channel_count) ||
-        !write_u32_le(writer->file, writer->sample_rate) ||
-        !write_u32_le(writer->file, byte_rate) ||
-        !write_u16_le(writer->file, block_align) ||
-        !write_u16_le(writer->file, bits_per_sample) ||
-        !write_u16_le(writer->file, 22) ||
-        !write_u16_le(writer->file, bits_per_sample) ||
-        !write_u32_le(writer->file, WAV_CHANNEL_MASK_714) ||
-        !write_bytes(writer->file, ieee_float_subformat,
-                     sizeof(ieee_float_subformat)) ||
-        !write_bytes(writer->file, "data", 4) ||
-        !write_u32_le(writer->file, data_size)) {
-        fprintf(stderr, "failed to write WAV header '%s'\n", writer->path);
+    if (fflush(writer->file) != 0) {
+        fprintf(stderr, "failed to flush '%s'\n", writer->path);
         return false;
     }
 
@@ -375,6 +435,11 @@ static bool wav_writer_finalize(struct wav_writer *writer) {
 static void wav_writer_close(struct wav_writer *writer) {
     if (!writer->file)
         return;
+    if (writer->streaming) {
+        fflush(writer->file);
+        writer->file = NULL;
+        return;
+    }
     fclose(writer->file);
     writer->file = NULL;
 }
@@ -385,7 +450,8 @@ static bool process_eac3_access_unit(starmine_ad_eac3_renderer_714 *renderer,
                                      int packet_index, int access_unit_index,
                                      int64_t pts, AVRational time_base,
                                      int *rendered_frames, bool *printed_layout,
-                                     struct progress_stats *progress) {
+                                     struct progress_stats *progress,
+                                     FILE *log) {
     starmine_ad_eac3_access_unit_info info;
     starmine_ad_render_714_frame frame;
     starmine_ad_status status;
@@ -415,15 +481,16 @@ static bool process_eac3_access_unit(starmine_ad_eac3_renderer_714 *renderer,
                       sizeof(time_buf));
     format_speed(progress, speed_buf, sizeof(speed_buf));
 
-    printf("packet=%d au=%d pts=%.6f time=%s speed=%s frame_size=%u sr=%u "
-           "joc=%u oamd=%u rendered=%u samples=%zu\n",
-           packet_index, access_unit_index, ts_to_seconds(pts, time_base),
-           time_buf, speed_buf, info.frame_size, info.sample_rate,
-           info.joc_payload_count, info.oamd_payload_count, frame.has_frame,
-           frame.samples_per_channel);
+    fprintf(log,
+            "packet=%d au=%d pts=%.6f time=%s speed=%s frame_size=%u sr=%u "
+            "joc=%u oamd=%u rendered=%u samples=%zu\n",
+            packet_index, access_unit_index, ts_to_seconds(pts, time_base),
+            time_buf, speed_buf, info.frame_size, info.sample_rate,
+            info.joc_payload_count, info.oamd_payload_count, frame.has_frame,
+            frame.samples_per_channel);
 
     if (frame.has_frame && !*printed_layout) {
-        print_channel_order(&frame);
+        print_channel_order(log, &frame);
         *printed_layout = true;
     }
 
@@ -440,7 +507,7 @@ static bool process_truehd_access_unit(
     starmine_ad_truehd_renderer_714 *renderer, struct wav_writer *writer,
     const uint8_t *data, size_t len, int packet_index, int access_unit_index,
     int64_t pts, AVRational time_base, int *rendered_frames,
-    bool *printed_layout, struct progress_stats *progress) {
+    bool *printed_layout, struct progress_stats *progress, FILE *log) {
     starmine_ad_truehd_access_unit_info info;
     starmine_ad_render_714_frame frame;
     starmine_ad_status status;
@@ -470,17 +537,18 @@ static bool process_truehd_access_unit(
                       sizeof(time_buf));
     format_speed(progress, speed_buf, sizeof(speed_buf));
 
-    printf("packet=%d au=%d pts=%.6f time=%s speed=%s truehd has_frame=%u "
-           "substream_changed=%u sr=%u bed=%u objects=%u metadata=%u "
-           "rendered=%u samples=%zu\n",
-           packet_index, access_unit_index, ts_to_seconds(pts, time_base),
-           time_buf, speed_buf, info.has_frame, info.substream_info_changed,
-           info.sample_rate, info.bed_channel_count, info.object_count,
-           info.metadata_update_count, frame.has_frame,
-           frame.samples_per_channel);
+    fprintf(log,
+            "packet=%d au=%d pts=%.6f time=%s speed=%s truehd has_frame=%u "
+            "substream_changed=%u sr=%u bed=%u objects=%u metadata=%u "
+            "rendered=%u samples=%zu\n",
+            packet_index, access_unit_index, ts_to_seconds(pts, time_base),
+            time_buf, speed_buf, info.has_frame, info.substream_info_changed,
+            info.sample_rate, info.bed_channel_count, info.object_count,
+            info.metadata_update_count, frame.has_frame,
+            frame.samples_per_channel);
 
     if (frame.has_frame && !*printed_layout) {
-        print_channel_order(&frame);
+        print_channel_order(log, &frame);
         *printed_layout = true;
     }
 
@@ -515,6 +583,7 @@ int main(int argc, char **argv) {
     int rendered_frames = 0;
     int result = 1;
     bool printed_layout = false;
+    FILE *log = NULL;
 
     memset(&writer, 0, sizeof(writer));
     progress_stats_init(&progress);
@@ -529,7 +598,7 @@ int main(int argc, char **argv) {
             if (i + 1 >= argc || !parse_int_arg(argv[i], argv[i + 1], &limit))
                 goto done;
             i++;
-        } else if (argv[i][0] == '-') {
+        } else if (argv[i][0] == '-' && strlen(argv[i]) != 1) {
             usage(argv[0]);
             goto done;
         } else if (!input) {
@@ -547,6 +616,7 @@ int main(int argc, char **argv) {
         goto done;
     }
 
+    log = status_file_for_output(output);
     av_log_set_level(AV_LOG_ERROR);
 
     if (!wav_writer_open(&writer, output))
@@ -631,8 +701,8 @@ int main(int argc, char **argv) {
         goto done;
     }
 
-    printf("input=%s output=%s stream=%d codec=%s limit=%d\n", input, output,
-           stream_index, codec_name, limit);
+    fprintf(log, "input=%s output=%s stream=%d codec=%s limit=%d\n", input,
+            output, stream_index, codec_name, limit);
 
     while (av_read_frame(fmt, pkt) >= 0) {
         AVStream *stream = NULL;
@@ -655,7 +725,7 @@ int main(int argc, char **argv) {
                     truehd_renderer, &writer, packet_data, (size_t)packet_size,
                     packet_index, access_unit_index, pkt->pts,
                     stream->time_base, &rendered_frames, &printed_layout,
-                    &progress)) {
+                    &progress, log)) {
                 av_packet_unref(pkt);
                 goto done;
             }
@@ -689,14 +759,14 @@ int main(int argc, char **argv) {
                             eac3_renderer, &writer, access_unit,
                             (size_t)access_unit_size, packet_index,
                             access_unit_index, pkt->pts, stream->time_base,
-                            &rendered_frames, &printed_layout, &progress);
+                            &rendered_frames, &printed_layout, &progress, log);
                     } else {
                         truehd_used_parser = true;
                         ok = process_truehd_access_unit(
                             truehd_renderer, &writer, access_unit,
                             (size_t)access_unit_size, packet_index,
                             access_unit_index, pkt->pts, stream->time_base,
-                            &rendered_frames, &printed_layout, &progress);
+                            &rendered_frames, &printed_layout, &progress, log);
                     }
 
                     if (!ok) {
@@ -745,7 +815,7 @@ int main(int argc, char **argv) {
                         (size_t)access_unit_size, packet_index,
                         access_unit_index, AV_NOPTS_VALUE,
                         fmt->streams[stream_index]->time_base, &rendered_frames,
-                        &printed_layout, &progress)) {
+                        &printed_layout, &progress, log)) {
                     goto done;
                 }
             } else {
@@ -754,7 +824,7 @@ int main(int argc, char **argv) {
                         (size_t)access_unit_size, packet_index,
                         access_unit_index, AV_NOPTS_VALUE,
                         fmt->streams[stream_index]->time_base, &rendered_frames,
-                        &printed_layout, &progress)) {
+                        &printed_layout, &progress, log)) {
                     goto done;
                 }
             }
@@ -789,7 +859,7 @@ finalize: {
 
     if (frame.has_frame) {
         if (!printed_layout) {
-            print_channel_order(&frame);
+            print_channel_order(log, &frame);
             printed_layout = true;
         }
         if (!wav_writer_write_frame(&writer, &frame))
@@ -807,12 +877,13 @@ finalize: {
         format_media_time(progress.processed_audio_seconds, time_buf,
                           sizeof(time_buf));
         format_speed(&progress, speed_buf, sizeof(speed_buf));
-        printf(
-            "access_units=%d rendered_frames=%d time=%s speed=%s output=%s\n",
-            access_unit_index, rendered_frames, time_buf, speed_buf, output);
+        fprintf(log,
+                "access_units=%d rendered_frames=%d time=%s speed=%s output=%s\n",
+                access_unit_index, rendered_frames, time_buf, speed_buf,
+                output);
     }
     if (rendered_frames == 0) {
-        printf("no 7.1.4 frames were produced\n");
+        fprintf(log, "no 7.1.4 frames were produced\n");
     }
     result = 0;
 

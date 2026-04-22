@@ -189,20 +189,27 @@ impl BlockHeader {
 }
 
 impl Block {
-    pub fn read(state: &mut ParserState, reader: &mut BsIoSliceReader) -> Result<Self> {
-        let mut b = Block::default();
+    pub fn read_into(
+        &mut self,
+        state: &mut ParserState,
+        reader: &mut BsIoSliceReader,
+    ) -> Result<()> {
+        self.restart_header = None;
+        self.block_header = None;
+        self.block_data_bits = None;
+        self.block_header_crc = 0;
 
         // block_header_exists
         if reader.get()? {
             // restart_header_exists
             if reader.get()? {
-                b.restart_header = Some(RestartHeader::read(state, reader)?);
+                self.restart_header = Some(RestartHeader::read(state, reader)?);
             }
 
-            b.block_header = Some(BlockHeader::read(state, reader)?);
+            self.block_header = Some(BlockHeader::read(state, reader)?);
         }
 
-        b.block_data_bits = if state.substream_state()?.error_protect {
+        self.block_data_bits = if state.substream_state()?.error_protect {
             let block_data_bits = reader.get_n(16)?;
             if block_data_bits > 16000 {
                 return Err((BlockError::BlockDataBitsTooLarge(block_data_bits)).into());
@@ -378,6 +385,18 @@ impl Block {
         } = *state.substream_state()?;
 
         let block_data_start_pos = reader.position()?;
+        let bypassed_lsb_bits: u64 = if restart_sync_word == 0x31EC {
+            lsb_bypass_bit_count[..primitive_matrices]
+                .iter()
+                .map(|&count| u64::from(count))
+                .sum()
+        } else {
+            lsb_bypass_used[..primitive_matrices]
+                .iter()
+                .map(|&used| u64::from(used))
+                .sum()
+        };
+        let check_huffman_sample_width = restart_sync_word != 0x31EC;
 
         for (chi, &lsbs) in huff_lsbs
             .iter()
@@ -397,13 +416,11 @@ impl Block {
 
         for blki in 0..block_size {
             // bypassed_lsb
-            let bypassed_lsb_start_pos = reader.position()?;
-
             if restart_sync_word == 0x31EC {
                 for pmi in 0..primitive_matrices {
                     let lsb_bypass_bit_count = lsb_bypass_bit_count[pmi];
 
-                    b.bypassed_lsb[blki][pmi] = if lsb_bypass_bit_count != 0 {
+                    self.bypassed_lsb[blki][pmi] = if lsb_bypass_bit_count != 0 {
                         reader.get_n::<u8>(lsb_bypass_bit_count as u32)?
                     } else {
                         0
@@ -413,7 +430,7 @@ impl Block {
                 for pmi in 0..primitive_matrices {
                     let lsb_bypass_used = lsb_bypass_used[pmi];
 
-                    b.bypassed_lsb[blki][pmi] = if lsb_bypass_used {
+                    self.bypassed_lsb[blki][pmi] = if lsb_bypass_used {
                         reader.get_n::<u8>(1)?
                     } else {
                         0
@@ -421,9 +438,7 @@ impl Block {
                 }
             }
 
-            let bypassed_lsb_bits = reader.position()? - bypassed_lsb_start_pos;
-            let block_data = &mut b.block_data[blki];
-            let mut position_checks_needed = false;
+            let block_data = &mut self.block_data[blki];
 
             // huff decode
             for chi in min_chan..=max_chan {
@@ -436,14 +451,7 @@ impl Block {
                 }
 
                 let lsbs_bits = huff_lsbs - quantiser_step_size;
-                let huff_start_pos = if restart_sync_word != 0x31EC {
-                    position_checks_needed = true;
-                    reader.position()?
-                } else {
-                    0
-                };
-
-                let mut audio_data = if huff_type != 0 {
+                let (mut audio_data, huff_size_bits) = if huff_type != 0 {
                     let huff_code = reader.get_huffman(huff_type)?;
                     let lsbs = if lsbs_bits > 0 {
                         reader.get_n::<u32>(lsbs_bits)? as i32
@@ -452,40 +460,44 @@ impl Block {
                     };
                     let shift = lsbs_bits as i32 + (2 - huff_type as i32);
 
-                    lsbs + (huff_code << lsbs_bits) - if shift < 0 { 0 } else { 1 << shift }
+                    (
+                        lsbs + (huff_code << lsbs_bits) - if shift < 0 { 0 } else { 1 << shift },
+                        huffman_sample_bits(huff_type, huff_code) + u64::from(lsbs_bits),
+                    )
                 } else {
                     let lsbs = if lsbs_bits > 0 {
                         reader.get_n::<u32>(lsbs_bits)? as i32
                     } else {
                         0
                     };
-                    lsbs - (if lsbs_bits > 0 {
-                        1 << (lsbs_bits - 1)
-                    } else {
-                        0
-                    })
+                    (
+                        lsbs - (if lsbs_bits > 0 {
+                            1 << (lsbs_bits - 1)
+                        } else {
+                            0
+                        }),
+                        u64::from(lsbs_bits),
+                    )
                 };
 
                 audio_data += huff_offset;
                 audio_data <<= quantiser_step_size;
 
-                if position_checks_needed {
-                    let huff_size = reader.position()? - huff_start_pos;
-
+                if check_huffman_sample_width {
                     if audio_data >= 1 << 23 {
                         return Err((BlockError::HuffmanPositiveSaturation).into());
                     } else if audio_data < -(1 << 23) {
                         return Err((BlockError::HuffmanNegativeSaturation).into());
                     }
 
-                    if chi == min_chan && huff_size + bypassed_lsb_bits > 32 {
+                    if chi == min_chan && huff_size_bits + bypassed_lsb_bits > 32 {
                         warn!(
                             "Channel {chi}: LSB + Huffman bits ({}) exceed 32-bit limit",
-                            huff_size + bypassed_lsb_bits
+                            huff_size_bits + bypassed_lsb_bits
                         )
                     }
 
-                    if huff_size > 29 {
+                    if huff_size_bits > 29 {
                         return Err((BlockError::HuffmanSampleTooLong).into());
                     }
                 }
@@ -494,7 +506,7 @@ impl Block {
             }
         }
 
-        if let Some(block_data_bits) = b.block_data_bits {
+        if let Some(block_data_bits) = self.block_data_bits {
             let actual_block_data_bits = reader.position()? - block_data_start_pos;
             if actual_block_data_bits != block_data_bits as u64 {
                 return Err((BlockError::BlockDataBitCountMismatch {
@@ -506,14 +518,14 @@ impl Block {
         }
 
         if error_protect {
-            b.block_header_crc = reader.get_n(8)?;
+            self.block_header_crc = reader.get_n(8)?;
             info!(
                 "Block header CRC found: {:#02X} (error protection enabled)",
-                b.block_header_crc
+                self.block_header_crc
             );
         }
 
-        Ok(b)
+        Ok(())
     }
 
     pub fn update_decoder_state(&self, state: &mut DecoderState) -> Result<()> {
@@ -531,5 +543,65 @@ impl Block {
         }
 
         Ok(())
+    }
+}
+
+#[inline(always)]
+fn huffman_sample_bits(huff_type: usize, huff_code: i32) -> u64 {
+    match huff_type {
+        1 => match huff_code {
+            0..=4 => 3,
+            -1 => 3,
+            5 => 4,
+            -2 => 4,
+            6 => 5,
+            -3 => 5,
+            7 => 6,
+            -4 => 6,
+            8 => 7,
+            -5 => 7,
+            9 => 8,
+            -6 => 8,
+            10 => 9,
+            -7 => 9,
+            _ => unreachable!("invalid huffman code for type 1: {huff_code}"),
+        },
+        2 => match huff_code {
+            0 | 1 => 2,
+            2 => 3,
+            -1 => 3,
+            3 => 4,
+            -2 => 4,
+            4 => 5,
+            -3 => 5,
+            5 => 6,
+            -4 => 6,
+            6 => 7,
+            -5 => 7,
+            7 => 8,
+            -6 => 8,
+            8 => 9,
+            -7 => 9,
+            _ => unreachable!("invalid huffman code for type 2: {huff_code}"),
+        },
+        3 => match huff_code {
+            0 => 1,
+            1 => 3,
+            -1 => 3,
+            2 => 4,
+            -2 => 4,
+            3 => 5,
+            -3 => 5,
+            4 => 6,
+            -4 => 6,
+            5 => 7,
+            -5 => 7,
+            6 => 8,
+            -6 => 8,
+            7 => 9,
+            -7 => 9,
+            _ => unreachable!("invalid huffman code for type 3: {huff_code}"),
+        },
+        _ => unreachable!("invalid huffman type: {huff_type}"),
     }
 }

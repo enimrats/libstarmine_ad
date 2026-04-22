@@ -144,7 +144,10 @@ impl SubstreamSegment {
             );
         }
 
-        let mut ss = Self::default();
+        let mut ss = Self {
+            block: Vec::with_capacity(4),
+            ..Default::default()
+        };
         let mut last_block_in_segment = false;
         state.substream_state_mut()?.block_index = 0;
 
@@ -156,7 +159,11 @@ impl SubstreamSegment {
                     (SubstreamError::TooManyBlocks(ss.block.len()))
                 );
             }
-            ss.block.push(Block::read(state, reader)?);
+            ss.block.push(Block::default());
+            ss.block
+                .last_mut()
+                .expect("block just pushed")
+                .read_into(state, reader)?;
             last_block_in_segment = reader.get()?;
             state.substream_state_mut()?.block_index += 1;
         }

@@ -413,18 +413,10 @@ impl DecoderState {
         let mut quantiser_masks_i64 = [0i64; 16];
         let mut quantiser_masks_i32 = [0i32; 16];
 
-        for chi in min_chan..=max_chan {
+        for chi in 0..16 {
             let mask = !((1i32 << quantiser_step_size[chi]) - 1);
             quantiser_masks_i32[chi] = mask;
             quantiser_masks_i64[chi] = i64::from(mask);
-        }
-
-        if max_matrix_chan > max_chan {
-            for chi in (max_chan + 1)..=max_matrix_chan {
-                let mask = !((1i32 << quantiser_step_size[chi]) - 1);
-                quantiser_masks_i32[chi] = mask;
-                quantiser_masks_i64[chi] = i64::from(mask);
-            }
         }
 
         let (max_val, min_val) = if restart_sync_word == 0x31EC {

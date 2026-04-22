@@ -1142,6 +1142,7 @@ fn map_bed_channel_to_714(channel: BedChannel) -> Option<usize> {
         BedChannel::FrontRight => Some(1),
         BedChannel::Center => Some(2),
         BedChannel::LowFrequencyEffects => Some(3),
+        BedChannel::RearCenter => None,
         BedChannel::RearLeft => Some(4),
         BedChannel::RearRight => Some(5),
         BedChannel::SurroundLeft => Some(6),
@@ -1179,6 +1180,11 @@ fn bed_channel_position(channel: BedChannel) -> Vec3 {
             x: -1.0,
             y: -1.0,
             z: 1.0,
+        },
+        BedChannel::RearCenter => Vec3 {
+            x: 0.0,
+            y: 0.0,
+            z: -1.0,
         },
         BedChannel::SurroundLeft => Vec3 {
             x: -1.0,

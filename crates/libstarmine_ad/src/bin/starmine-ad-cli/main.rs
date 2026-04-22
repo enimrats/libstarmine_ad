@@ -815,6 +815,7 @@ fn bed_channel_name(channel: BedChannel) -> &'static str {
         BedChannel::LowFrequencyEffects => "LFE",
         BedChannel::SurroundLeft => "SL",
         BedChannel::SurroundRight => "SR",
+        BedChannel::RearCenter => "RC",
         BedChannel::RearLeft => "RL",
         BedChannel::RearRight => "RR",
         BedChannel::TopFrontLeft => "TFL",

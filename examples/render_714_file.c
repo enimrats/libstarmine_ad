@@ -168,6 +168,8 @@ static const char *bed_channel_name(starmine_ad_bed_channel channel) {
         return "SL";
     case STARMINE_AD_BED_CHANNEL_SURROUND_RIGHT:
         return "SR";
+    case STARMINE_AD_BED_CHANNEL_REAR_CENTER:
+        return "SC";
     case STARMINE_AD_BED_CHANNEL_REAR_LEFT:
         return "RL";
     case STARMINE_AD_BED_CHANNEL_REAR_RIGHT:

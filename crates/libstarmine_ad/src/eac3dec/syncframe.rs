@@ -30,6 +30,10 @@ const DEF_CPL_BNDSTRC: [bool; 18] = [
     false, false, false, false, false, false, false, false, true, false, true, true, false, true,
     true, true, true, true,
 ];
+const ECPL_SUBBAND_TAB: [usize; 23] = [
+    13, 19, 25, 31, 37, 49, 61, 73, 85, 97, 109, 121, 133, 145, 157, 169, 181, 193, 205, 217, 229,
+    241, 253,
+];
 const FRM_EXP_STRATEGIES: [[u8; 6]; 32] = [
     [1, 0, 0, 0, 0, 0],
     [1, 0, 0, 0, 0, 3],
@@ -471,11 +475,18 @@ struct TrailingAuxDataInfo {
     bytes: Vec<u8>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone)]
 struct BlockSyntaxState {
     bit_allocation_params: BitAllocationParams,
+    coupling_allocation: AllocationState,
+    coupling_coordinates: Vec<[f32; DEF_CPL_BNDSTRC.len()]>,
+    coupling_delta_bit_allocation: DeltaBitAllocationState,
     channel_allocations: Vec<AllocationState>,
     channel_delta_bit_allocation: Vec<DeltaBitAllocationState>,
+    cpl_fast_leak: i32,
+    cpl_fgain_code: u8,
+    cpl_fsnr_offset: i32,
+    cpl_slow_leak: i32,
     channel_fgain_codes: Vec<u8>,
     channel_fsnr_offsets: Vec<i32>,
     chbwcod: Vec<u8>,
@@ -507,12 +518,19 @@ impl BlockSyntaxState {
     fn new(fullband_channels: usize, lfe_on: bool, sample_rate_index: usize) -> Self {
         Self {
             bit_allocation_params: BitAllocationParams::default(),
+            coupling_allocation: AllocationState::new(),
+            coupling_coordinates: vec![[0.0; DEF_CPL_BNDSTRC.len()]; fullband_channels],
+            coupling_delta_bit_allocation: DeltaBitAllocationState::default(),
             channel_allocations: (0..fullband_channels)
                 .map(|_| AllocationState::new())
                 .collect(),
             channel_delta_bit_allocation: (0..fullband_channels)
                 .map(|_| DeltaBitAllocationState::default())
                 .collect(),
+            cpl_fast_leak: 0,
+            cpl_fgain_code: 4,
+            cpl_fsnr_offset: 0,
+            cpl_slow_leak: 0,
             channel_fgain_codes: vec![4; fullband_channels],
             channel_fsnr_offsets: vec![0; fullband_channels],
             chbwcod: vec![0; fullband_channels],
@@ -559,9 +577,15 @@ impl BlockSyntaxState {
         self.ecplinu = false;
         self.cplbegf = 0;
         self.cplendf = 0;
+        self.cpl_fast_leak = 0;
+        self.cpl_fgain_code = 4;
+        self.cpl_fsnr_offset = 0;
+        self.cpl_slow_leak = 0;
         self.phsflginu = false;
         self.ncplbnd = 0;
         self.ncplsubnd = 0;
+        self.coupling_delta_bit_allocation = DeltaBitAllocationState::default();
+        self.coupling_allocation.clear_bap();
         for in_use in &mut self.chincpl {
             *in_use = false;
         }
@@ -569,6 +593,52 @@ impl BlockSyntaxState {
             *first = true;
         }
         self.first_cpl_leak = true;
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct AuxDataDecodeState {
+    fullband_channels: usize,
+    lfe_on: bool,
+    sample_rate_index: Option<usize>,
+    block_syntax: Option<BlockSyntaxState>,
+}
+
+impl AuxDataDecodeState {
+    pub(crate) fn reset(&mut self) {
+        self.fullband_channels = 0;
+        self.lfe_on = false;
+        self.sample_rate_index = None;
+        self.block_syntax = None;
+    }
+
+    fn prepare_block_syntax(
+        &mut self,
+        fullband_channels: usize,
+        lfe_on: bool,
+        sample_rate_index: usize,
+    ) -> BlockSyntaxState {
+        let needs_reset = self.sample_rate_index != Some(sample_rate_index)
+            || self.fullband_channels != fullband_channels
+            || self.lfe_on != lfe_on
+            || self.block_syntax.is_none();
+        if needs_reset {
+            self.fullband_channels = fullband_channels;
+            self.lfe_on = lfe_on;
+            self.sample_rate_index = Some(sample_rate_index);
+            self.block_syntax = Some(BlockSyntaxState::new(
+                fullband_channels,
+                lfe_on,
+                sample_rate_index,
+            ));
+        }
+        self.block_syntax
+            .clone()
+            .unwrap_or_else(|| BlockSyntaxState::new(fullband_channels, lfe_on, sample_rate_index))
+    }
+
+    fn commit_block_syntax(&mut self, state: BlockSyntaxState) {
+        self.block_syntax = Some(state);
     }
 }
 
@@ -618,12 +688,13 @@ impl CoreDecodeState {
 /// externally. Stateful callers should prefer [`crate::eac3dec::Decoder`].
 pub fn inspect_access_unit(data: &[u8]) -> Result<AccessUnitInfo, ParseError> {
     let mut metadata_state = MetadataParseState::default();
-    inspect_access_unit_with_metadata_state(data, &mut metadata_state)
+    inspect_access_unit_with_metadata_state(data, &mut metadata_state, None)
 }
 
 pub(crate) fn inspect_access_unit_with_metadata_state(
     data: &[u8],
     metadata_state: &mut MetadataParseState,
+    mut aux_state: Option<&mut AuxDataDecodeState>,
 ) -> Result<AccessUnitInfo, ParseError> {
     if data.len() < 7 {
         return Err(ParseError::ShortPacket);
@@ -799,6 +870,11 @@ pub(crate) fn inspect_access_unit_with_metadata_state(
                 Err(err) => return Err(err),
             }
         } else {
+            let mut walk_state = if let Some(state) = aux_state.as_deref_mut() {
+                state.prepare_block_syntax(fullband_channels as usize, lfe_on, sample_rate_index)
+            } else {
+                BlockSyntaxState::new(fullband_channels as usize, lfe_on, sample_rate_index)
+            };
             match collect_skip_fields_without_block_start(
                 frame,
                 frame_type,
@@ -808,11 +884,14 @@ pub(crate) fn inspect_access_unit_with_metadata_state(
                 lfe_on,
                 &audio_frame.info,
                 trailing_aux_data.start_bit_offset,
-                sample_rate_index,
+                &mut walk_state,
             ) {
                 Ok(fields) => {
                     skip_fields = fields;
                     aux_parse_status = AuxParseStatus::Extracted;
+                    if let Some(state) = aux_state.as_deref_mut() {
+                        state.commit_block_syntax(walk_state);
+                    }
                 }
                 Err(err @ ParseError::UnsupportedFeature(_)) => {
                     emit_aux_debug(format_args!(
@@ -1331,14 +1410,11 @@ fn collect_skip_fields_without_block_start(
     lfe_on: bool,
     audio_frame: &AudioFrameInfo,
     audio_payload_end_bit: usize,
-    sample_rate_index: usize,
+    state: &mut BlockSyntaxState,
 ) -> Result<Vec<SkipFieldInfo>, ParseError> {
     let mut reader = BitReader::with_offset(frame, audio_frame.block_payload_start_bit_offset);
     reader.set_limit_bits(audio_payload_end_bit);
 
-    // TODO: Carry cross-access-unit allocation reuse state through Decoder. The current
-    // per-access-unit parser assumes block 0 has enough in-frame data to seed reuse state.
-    let mut state = BlockSyntaxState::new(fullband_channels, lfe_on, sample_rate_index);
     let mut skip_fields = Vec::new();
     for block in 0..num_blocks {
         if let Some(skip_field) = parse_block(
@@ -1349,7 +1425,7 @@ fn collect_skip_fields_without_block_start(
             fullband_channels,
             lfe_on,
             audio_frame,
-            &mut state,
+            state,
             true,
         )? {
             skip_fields.push(skip_field);
@@ -1495,17 +1571,7 @@ fn parse_block(
         reader.skip_bits(10).ok_or(ParseError::ShortPacket)?;
     }
 
-    if audio_frame.coupling_in_use[block] {
-        let coupling_leak_present = if state.first_cpl_leak {
-            state.first_cpl_leak = false;
-            true
-        } else {
-            reader.read_bit().ok_or(ParseError::ShortPacket)?
-        };
-        if coupling_leak_present {
-            reader.skip_bits(6).ok_or(ParseError::ShortPacket)?;
-        }
-    }
+    read_coupling_leak_info(reader, audio_frame.coupling_in_use[block], state)?;
 
     read_delta_bit_allocation(reader, block, fullband_channels, audio_frame, state)?;
 
@@ -1555,6 +1621,120 @@ fn skip_conditional_bits(reader: &mut BitReader<'_>, bits: usize) -> Result<(), 
         reader.skip_bits(bits).ok_or(ParseError::ShortPacket)?;
     }
     Ok(())
+}
+
+fn decode_coupling_coordinate(exponent: i32, mantissa: i32, master_coord: i32) -> f32 {
+    let shift = if exponent != 15 {
+        15 - exponent - master_coord
+    } else {
+        15 - master_coord
+    };
+    let base = if exponent != 15 {
+        mantissa + 16
+    } else {
+        mantissa
+    };
+    let scaled = if shift >= 0 {
+        base.checked_shl(shift as u32).unwrap_or(0)
+    } else {
+        base >> (-shift) as u32
+    };
+    scaled as f32 / 131_072.0
+}
+
+fn coupling_start_mantissa(state: &BlockSyntaxState) -> usize {
+    37 + 12 * state.cplbegf
+}
+
+fn read_coupling_leak_info(
+    reader: &mut BitReader<'_>,
+    coupling_in_use: bool,
+    state: &mut BlockSyntaxState,
+) -> Result<(), ParseError> {
+    if !coupling_in_use {
+        return Ok(());
+    }
+
+    let coupling_leak_present = if state.first_cpl_leak {
+        state.first_cpl_leak = false;
+        true
+    } else {
+        reader.read_bit().ok_or(ParseError::ShortPacket)?
+    };
+    if coupling_leak_present {
+        state.cpl_fast_leak =
+            ((reader.read_bits(3).ok_or(ParseError::ShortPacket)? as i32) << 8) + 768;
+        state.cpl_slow_leak =
+            ((reader.read_bits(3).ok_or(ParseError::ShortPacket)? as i32) << 8) + 768;
+    }
+
+    Ok(())
+}
+
+fn coupling_end_mantissa(state: &BlockSyntaxState) -> Result<usize, ParseError> {
+    if state.ecplinu {
+        let begin = *ECPL_SUBBAND_TAB
+            .get(state.cplbegf)
+            .ok_or(ParseError::InvalidHeader("ecplbegf"))?;
+        let end = *ECPL_SUBBAND_TAB
+            .get(state.cplendf)
+            .ok_or(ParseError::InvalidHeader("ecplendf"))?;
+        if end < begin {
+            return Err(ParseError::InvalidHeader("ecplendf"));
+        }
+        Ok(end)
+    } else {
+        Ok(37 + 12 * (state.cplendf + 3))
+    }
+}
+
+fn allocate_coupling_channel(state: &mut BlockSyntaxState) -> Result<(), ParseError> {
+    let cplendmant = coupling_end_mantissa(state)?;
+    let coupling_snr_offset = (((state.csnr_offset - 15) << 4) + state.cpl_fsnr_offset) << 2;
+    if state.csnr_offset == 0 && state.cpl_fsnr_offset == 0 {
+        state.coupling_allocation.clear_bap();
+        return Ok(());
+    }
+
+    state.coupling_allocation.allocate(
+        coupling_start_mantissa(state),
+        cplendmant,
+        state.cpl_fgain_code,
+        coupling_snr_offset,
+        state.bit_allocation_params,
+        state.sample_rate_index,
+        &state.coupling_delta_bit_allocation,
+        state.cpl_fast_leak,
+        state.cpl_slow_leak,
+    )
+}
+
+fn apply_standard_coupling(
+    state: &BlockSyntaxState,
+    channel: usize,
+    coeffs: &mut [f32; 256],
+    coupling_coeffs: &[f32; 256],
+) {
+    let mut used_band = 0usize;
+    for subband in 0..state.ncplsubnd {
+        if subband != 0
+            && !state
+                .cpl_band_struct
+                .get(state.cplbegf + subband)
+                .copied()
+                .unwrap_or(false)
+        {
+            used_band += 1;
+        }
+        let gain = state.coupling_coordinates[channel]
+            .get(used_band)
+            .copied()
+            .unwrap_or_default();
+        let offset = (state.cplbegf + subband) * 12 + 37;
+        for bin in 0..12 {
+            coeffs[bin + offset] = coupling_coeffs[bin + offset] * gain;
+        }
+    }
 }
 
 fn read_spx(
@@ -1756,9 +1936,13 @@ fn read_coupling_coordinates(
                 reader.read_bit().ok_or(ParseError::ShortPacket)?
             };
             if coordinates_present {
-                reader
-                    .skip_bits(2 + state.ncplbnd * 8)
-                    .ok_or(ParseError::ShortPacket)?;
+                let master_coord = reader.read_bits(2).ok_or(ParseError::ShortPacket)? as i32 * 3;
+                for band in 0..state.ncplbnd {
+                    let exponent = reader.read_bits(4).ok_or(ParseError::ShortPacket)? as i32;
+                    let mantissa = reader.read_bits(4).ok_or(ParseError::ShortPacket)? as i32;
+                    state.coupling_coordinates[channel][band] =
+                        decode_coupling_coordinate(exponent, mantissa, master_coord);
+                }
                 stereo_phase_flags_required |= channel_mode == 2;
             }
         } else {
@@ -1801,9 +1985,13 @@ fn read_exponents(
         if let Some(strategy) = audio_frame.coupling_exponent_strategy[block] {
             let ncplgrps =
                 grouped_exponent_count(cplendmant.saturating_sub(cplstrtmant), strategy)?;
-            reader
-                .skip_bits(4 + ncplgrps * 7)
-                .ok_or(ParseError::ShortPacket)?;
+            state.coupling_allocation.read_coupling_exponents(
+                reader,
+                strategy,
+                cplstrtmant,
+                cplendmant,
+                ncplgrps,
+            )?;
         }
     }
 
@@ -1887,6 +2075,7 @@ fn read_snr_offsets(
     if audio_frame.snr_offset_strategy == 0 {
         state.csnr_offset = audio_frame.frame_csnr_offset.unwrap_or_default() as i32;
         let fsnr = audio_frame.frame_fsnr_offset.unwrap_or_default() as i32;
+        state.cpl_fsnr_offset = fsnr;
         for offset in &mut state.channel_fsnr_offsets {
             *offset = fsnr;
         }
@@ -1909,6 +2098,7 @@ fn read_snr_offsets(
     match audio_frame.snr_offset_strategy {
         1 => {
             let block_fsnr = reader.read_bits(4).ok_or(ParseError::ShortPacket)? as i32;
+            state.cpl_fsnr_offset = block_fsnr;
             for offset in &mut state.channel_fsnr_offsets {
                 *offset = block_fsnr;
             }
@@ -1918,7 +2108,7 @@ fn read_snr_offsets(
         }
         2 => {
             if audio_frame.coupling_in_use[block] {
-                reader.skip_bits(4).ok_or(ParseError::ShortPacket)?;
+                state.cpl_fsnr_offset = reader.read_bits(4).ok_or(ParseError::ShortPacket)? as i32;
             }
             for channel in 0..fullband_channels {
                 state.channel_fsnr_offsets[channel] =
@@ -1945,7 +2135,7 @@ fn read_frame_gain_codes(
         && reader.read_bit().ok_or(ParseError::ShortPacket)?;
     if frame_gain_present {
         if audio_frame.coupling_in_use[block] {
-            reader.skip_bits(3).ok_or(ParseError::ShortPacket)?;
+            state.cpl_fgain_code = reader.read_bits(3).ok_or(ParseError::ShortPacket)? as u8;
         }
         for channel in 0..fullband_channels {
             state.channel_fgain_codes[channel] =
@@ -1955,6 +2145,7 @@ fn read_frame_gain_codes(
             state.lfe_fgain_code = reader.read_bits(3).ok_or(ParseError::ShortPacket)? as u8;
         }
     } else {
+        state.cpl_fgain_code = 4;
         for fgain in &mut state.channel_fgain_codes {
             *fgain = 4;
         }
@@ -1979,9 +2170,11 @@ fn read_delta_bit_allocation(
     }
 
     let coupling_mode = if audio_frame.coupling_in_use[block] {
-        Some(DeltaBitAllocationMode::from_bits(
+        let mode = DeltaBitAllocationMode::from_bits(
             reader.read_bits(2).ok_or(ParseError::ShortPacket)? as u8,
-        )?)
+        )?;
+        state.coupling_delta_bit_allocation.mode = mode;
+        Some(mode)
     } else {
         None
     };
@@ -1993,8 +2186,7 @@ fn read_delta_bit_allocation(
     }
 
     if coupling_mode == Some(DeltaBitAllocationMode::NewInfoFollows) {
-        let mut ignored = DeltaBitAllocationState::default();
-        ignored.read_segments(reader)?;
+        state.coupling_delta_bit_allocation.read_segments(reader)?;
     }
     for channel in 0..fullband_channels {
         if state.channel_delta_bit_allocation[channel].mode
@@ -2019,14 +2211,15 @@ fn consume_block_mantissas(
         // do not need to fall back to sync-anchored recovery.
         return Err(ParseError::UnsupportedFeature("spx-no-blkstart"));
     }
-    if audio_frame.coupling_in_use[block] {
-        // TODO: Walk coupling mantissas so no-blkstrtinfo frames with coupling can use
-        // the real parser path instead of the current fallback.
-        return Err(ParseError::UnsupportedFeature("coupling-no-blkstart"));
-    }
 
     let mut mantissa_groups = MantissaGroupState::new_block();
     let mut total_mantissa_bits = 0usize;
+    let first_coupled_channel = if audio_frame.coupling_in_use[block] {
+        allocate_coupling_channel(state)?;
+        state.chincpl.iter().position(|in_use| *in_use)
+    } else {
+        None
+    };
     for channel in 0..allocation.channel_end_mantissas.len() {
         let end_mantissa = allocation.channel_end_mantissas[channel];
         if end_mantissa > 256 {
@@ -2066,6 +2259,26 @@ fn consume_block_mantissas(
         reader
             .skip_bits(mantissa_bits)
             .ok_or(ParseError::ShortPacket)?;
+
+        if first_coupled_channel == Some(channel) {
+            let coupling_bits = state.coupling_allocation.count_mantissa_bits(
+                coupling_start_mantissa(state),
+                coupling_end_mantissa(state)?,
+                &mut mantissa_groups,
+            );
+            total_mantissa_bits += coupling_bits;
+            emit_aux_debug(format_args!(
+                "block={block} cpl startmant={} endmant={} csnr={} fsnr={} fgain={} mantissa_bits={coupling_bits}",
+                coupling_start_mantissa(state),
+                coupling_end_mantissa(state)?,
+                state.csnr_offset,
+                state.cpl_fsnr_offset,
+                state.cpl_fgain_code,
+            ));
+            reader
+                .skip_bits(coupling_bits)
+                .ok_or(ParseError::ShortPacket)?;
+        }
     }
 
     if lfe_on {
@@ -2127,8 +2340,9 @@ pub(crate) fn decode_core_pcm_frame_with_state_into(
     state: &mut CoreDecodeState,
     pcm: &mut CorePcmFrame,
 ) -> Result<(), ParseError> {
-    if info.frame_type != FrameType::Independent {
-        // TODO: Merge dependent / converted substreams before exposing a general PCM path.
+    if info.frame_type == FrameType::Dependent {
+        // TODO: Merge dependent substreams with their associated independent substream before
+        // exposing a general PCM path.
         return Err(ParseError::UnsupportedFeature("non-independent-core-pcm"));
     }
 
@@ -2209,12 +2423,24 @@ fn prepare_lfe_channel_storage(channel: &mut Option<Vec<f32>>, enabled: bool, sa
 
 fn fullband_channel_order(channel_mode: u8) -> Result<&'static [BedChannel], ParseError> {
     match channel_mode {
+        0 => Ok(&[BedChannel::Center, BedChannel::Center]),
         1 => Ok(&[BedChannel::Center]),
         2 => Ok(&[BedChannel::FrontLeft, BedChannel::FrontRight]),
         3 => Ok(&[
             BedChannel::FrontLeft,
             BedChannel::Center,
             BedChannel::FrontRight,
+        ]),
+        4 => Ok(&[
+            BedChannel::FrontLeft,
+            BedChannel::FrontRight,
+            BedChannel::RearCenter,
+        ]),
+        5 => Ok(&[
+            BedChannel::FrontLeft,
+            BedChannel::Center,
+            BedChannel::FrontRight,
+            BedChannel::RearCenter,
         ]),
         6 => Ok(&[
             BedChannel::FrontLeft,
@@ -2229,11 +2455,6 @@ fn fullband_channel_order(channel_mode: u8) -> Result<&'static [BedChannel], Par
             BedChannel::SurroundLeft,
             BedChannel::SurroundRight,
         ]),
-        0 | 4 | 5 => {
-            // TODO: Model dual-mono and rear-center bed mappings explicitly when those layouts
-            // need PCM output. The current sample only exercises acmod 7.
-            Err(ParseError::UnsupportedFeature("channel-mode-pcm"))
-        }
         _ => Err(ParseError::InvalidHeader("channel-mode")),
     }
 }
@@ -2289,10 +2510,6 @@ fn decode_block_core_pcm(
         &info.audio_frame,
         state,
     )?;
-    if info.audio_frame.coupling_in_use[block] {
-        // TODO: Decode coupling channel coeffs and apply coupling coordinates for PCM output.
-        return Err(ParseError::UnsupportedFeature("coupling-pcm"));
-    }
 
     let allocation = read_exponents(
         reader,
@@ -2326,17 +2543,7 @@ fn decode_block_core_pcm(
         reader.skip_bits(10).ok_or(ParseError::ShortPacket)?;
     }
 
-    if info.audio_frame.coupling_in_use[block] {
-        let coupling_leak_present = if state.first_cpl_leak {
-            state.first_cpl_leak = false;
-            true
-        } else {
-            reader.read_bit().ok_or(ParseError::ShortPacket)?
-        };
-        if coupling_leak_present {
-            reader.skip_bits(6).ok_or(ParseError::ShortPacket)?;
-        }
-    }
+    read_coupling_leak_info(reader, info.audio_frame.coupling_in_use[block], state)?;
 
     read_delta_bit_allocation(reader, block, fullband_count, &info.audio_frame, state)?;
 
@@ -2378,6 +2585,13 @@ fn decode_block_pcm_mantissas(
     lfe_channel: Option<&mut Vec<f32>>,
 ) -> Result<(), ParseError> {
     let mut mantissa_state = MantissaDecodeState::new_block();
+    let mut coupling_coeffs = [0.0f32; 256];
+    let first_coupled_channel = if state.chincpl.iter().any(|in_use| *in_use) {
+        allocate_coupling_channel(state)?;
+        state.chincpl.iter().position(|in_use| *in_use)
+    } else {
+        None
+    };
 
     for channel in 0..allocation.channel_end_mantissas.len() {
         let end_mantissa = allocation.channel_end_mantissas[channel];
@@ -2411,6 +2625,18 @@ fn decode_block_pcm_mantissas(
             end_mantissa,
             &mut mantissa_state,
         )?;
+        if first_coupled_channel == Some(channel) {
+            state.coupling_allocation.decode_transform_coeffs(
+                reader,
+                &mut coupling_coeffs,
+                coupling_start_mantissa(state),
+                coupling_end_mantissa(state)?,
+                &mut mantissa_state,
+            )?;
+        }
+        if state.chincpl[channel] {
+            apply_standard_coupling(state, channel, &mut coeffs, &coupling_coeffs);
+        }
         imdct[channel].apply(
             &coeffs,
             block_switch.get(channel).copied().unwrap_or(false),
@@ -2629,7 +2855,11 @@ fn log2_ceil(value: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{EmdfSource, ExpStrategy, FrameType, ParseError, inspect_access_unit};
+    use super::{
+        AccessUnitInfo, AudioFrameInfo, BlockSyntaxState, CoreDecodeState, EmdfSource, ExpStrategy,
+        FrameType, ParseError, decode_block_core_pcm, inspect_access_unit,
+    };
+    use crate::renderer::BedChannel;
 
     fn push_bits(bits: &mut Vec<bool>, value: u32, width: usize) {
         for bit in (0..width).rev() {
@@ -2706,23 +2936,115 @@ mod tests {
         bytes
     }
 
-    fn build_single_block_payload(skip_bytes: &[u8]) -> Vec<u8> {
+    fn push_zeroed_channel_exponents(
+        bits: &mut Vec<bool>,
+        strategy: ExpStrategy,
+        end_mantissa: usize,
+    ) {
+        let groups = super::grouped_exponent_count(end_mantissa, strategy)
+            .expect("channel exponent group count");
+        push_bits(bits, 0, 4);
+        for _ in 0..groups {
+            push_bits(bits, 0, 7);
+        }
+        push_bits(bits, 0, 2);
+    }
+
+    fn push_zeroed_coupling_exponents(
+        bits: &mut Vec<bool>,
+        strategy: ExpStrategy,
+        start_mantissa: usize,
+        end_mantissa: usize,
+    ) {
+        let groups =
+            super::grouped_exponent_count(end_mantissa.saturating_sub(start_mantissa), strategy)
+                .expect("coupling exponent group count");
+        push_bits(bits, 0, 4);
+        for _ in 0..groups {
+            push_bits(bits, 0, 7);
+        }
+    }
+
+    fn build_single_block_payload(frame_type: FrameType, skip_bytes: &[u8]) -> Vec<u8> {
         let mut bits = Vec::new();
         push_bits(&mut bits, 0, 1);
         push_bits(&mut bits, 0, 1);
         push_bits(&mut bits, 0, 6);
-        push_bits(&mut bits, 0, 4);
-        for _ in 0..6 {
-            push_bits(&mut bits, 0, 7);
+        push_zeroed_channel_exponents(&mut bits, ExpStrategy::D45, 73);
+        if frame_type == FrameType::Independent {
+            push_bits(&mut bits, 0, 1);
         }
-        push_bits(&mut bits, 0, 2);
-        push_bits(&mut bits, 0, 1);
         push_bits(&mut bits, 1, 1);
         push_bits(&mut bits, skip_bytes.len() as u32, 9);
         for &byte in skip_bytes {
             push_bits(&mut bits, byte as u32, 8);
         }
         bits_to_bytes(&bits, bits.len().div_ceil(8))
+    }
+
+    fn build_single_block_coupling_payload(frame_type: FrameType, skip_bytes: &[u8]) -> Vec<u8> {
+        let mut bits = Vec::new();
+        push_bits(&mut bits, 0, 1);
+        push_bits(&mut bits, 0, 1);
+        push_bits(&mut bits, 0, 1);
+        push_bits(&mut bits, 1, 1);
+        push_bits(&mut bits, 1, 1);
+        push_bits(&mut bits, 1, 1);
+        push_bits(&mut bits, 0, 4);
+        push_bits(&mut bits, 0, 4);
+        push_bits(&mut bits, 0, 1);
+        for _ in 0..3 {
+            push_bits(&mut bits, 0, 2);
+            for _ in 0..3 {
+                push_bits(&mut bits, 0, 4);
+                push_bits(&mut bits, 0, 4);
+            }
+        }
+        push_zeroed_coupling_exponents(&mut bits, ExpStrategy::D45, 37, 73);
+        for _ in 0..3 {
+            push_zeroed_channel_exponents(&mut bits, ExpStrategy::D45, 37);
+        }
+        if frame_type == FrameType::Independent {
+            push_bits(&mut bits, 0, 1);
+        }
+        push_bits(&mut bits, 0, 3);
+        push_bits(&mut bits, 0, 3);
+        push_bits(&mut bits, 1, 1);
+        push_bits(&mut bits, skip_bytes.len() as u32, 9);
+        for &byte in skip_bytes {
+            push_bits(&mut bits, byte as u32, 8);
+        }
+        bits_to_bytes(&bits, bits.len().div_ceil(8))
+    }
+
+    fn single_block_audio_frame(fullband_channels: usize, coupling_in_use: bool) -> AudioFrameInfo {
+        AudioFrameInfo {
+            exponent_strategies_embedded: true,
+            adaptive_hybrid_transform_enabled: false,
+            snr_offset_strategy: 0,
+            transient_processing_enabled: false,
+            block_switching_enabled: false,
+            dithering_enabled: false,
+            bit_allocation_mode_enabled: false,
+            frame_gain_syntax_enabled: false,
+            delta_bit_allocation_enabled: false,
+            skip_field_syntax_enabled: true,
+            spectral_extension_attenuation_enabled: false,
+            coupling_strategy_updates: vec![coupling_in_use],
+            coupling_in_use: vec![coupling_in_use],
+            coupling_exponent_strategy: vec![coupling_in_use.then_some(ExpStrategy::D45)],
+            channel_exponent_strategy: vec![vec![ExpStrategy::D45; fullband_channels]],
+            lfe_exponent_strategy: Vec::new(),
+            converter_exponent_strategy_present: false,
+            converter_exponent_strategy: Vec::new(),
+            frame_csnr_offset: Some(0),
+            frame_fsnr_offset: Some(0),
+            transient_processors: vec![None],
+            spectral_extension_attenuation: vec![None],
+            block_start_info_present: false,
+            block_start_info_bit_len: 0,
+            block_payload_start_bit_offset: 0,
+        }
     }
 
     #[test]
@@ -2756,7 +3078,7 @@ mod tests {
     fn extracts_aux_data_from_single_block_skip_field() {
         let emdf = build_emdf_block(14, &[0xAA]);
         assert_eq!(super::scan_emdf_blocks(&emdf).len(), 1);
-        let block_payload = build_single_block_payload(&emdf);
+        let block_payload = build_single_block_payload(FrameType::Independent, &emdf);
         let audio_frame = super::AudioFrameInfo {
             exponent_strategies_embedded: true,
             adaptive_hybrid_transform_enabled: false,
@@ -2808,36 +3130,11 @@ mod tests {
     #[test]
     fn accepts_zero_padded_tail_without_block_start_info() {
         let emdf = build_emdf_block(14, &[0xAA]);
-        let mut block_payload = build_single_block_payload(&emdf);
+        let mut block_payload = build_single_block_payload(FrameType::Independent, &emdf);
         block_payload.extend_from_slice(&[0u8; 16]);
 
-        let audio_frame = super::AudioFrameInfo {
-            exponent_strategies_embedded: true,
-            adaptive_hybrid_transform_enabled: false,
-            snr_offset_strategy: 0,
-            transient_processing_enabled: false,
-            block_switching_enabled: false,
-            dithering_enabled: false,
-            bit_allocation_mode_enabled: false,
-            frame_gain_syntax_enabled: false,
-            delta_bit_allocation_enabled: false,
-            skip_field_syntax_enabled: true,
-            spectral_extension_attenuation_enabled: false,
-            coupling_strategy_updates: vec![false],
-            coupling_in_use: vec![false],
-            coupling_exponent_strategy: vec![None],
-            channel_exponent_strategy: vec![vec![ExpStrategy::D45]],
-            lfe_exponent_strategy: Vec::new(),
-            converter_exponent_strategy_present: false,
-            converter_exponent_strategy: Vec::new(),
-            frame_csnr_offset: Some(0),
-            frame_fsnr_offset: Some(0),
-            transient_processors: vec![None],
-            spectral_extension_attenuation: vec![None],
-            block_start_info_present: false,
-            block_start_info_bit_len: 0,
-            block_payload_start_bit_offset: 0,
-        };
+        let audio_frame = single_block_audio_frame(1, false);
+        let mut state = BlockSyntaxState::new(1, false, 0);
 
         let skip_fields = super::collect_skip_fields_without_block_start(
             &block_payload,
@@ -2848,7 +3145,7 @@ mod tests {
             false,
             &audio_frame,
             block_payload.len() * 8,
-            0,
+            &mut state,
         )
         .expect("single-block payload with zero padding should parse");
 
@@ -2859,37 +3156,12 @@ mod tests {
     #[test]
     fn accepts_zero_padded_tail_with_footer_prefix_without_block_start_info() {
         let emdf = build_emdf_block(14, &[0xAA]);
-        let mut block_payload = build_single_block_payload(&emdf);
+        let mut block_payload = build_single_block_payload(FrameType::Independent, &emdf);
         block_payload.extend_from_slice(&[0u8; 16]);
         block_payload.push(0x02);
 
-        let audio_frame = super::AudioFrameInfo {
-            exponent_strategies_embedded: true,
-            adaptive_hybrid_transform_enabled: false,
-            snr_offset_strategy: 0,
-            transient_processing_enabled: false,
-            block_switching_enabled: false,
-            dithering_enabled: false,
-            bit_allocation_mode_enabled: false,
-            frame_gain_syntax_enabled: false,
-            delta_bit_allocation_enabled: false,
-            skip_field_syntax_enabled: true,
-            spectral_extension_attenuation_enabled: false,
-            coupling_strategy_updates: vec![false],
-            coupling_in_use: vec![false],
-            coupling_exponent_strategy: vec![None],
-            channel_exponent_strategy: vec![vec![ExpStrategy::D45]],
-            lfe_exponent_strategy: Vec::new(),
-            converter_exponent_strategy_present: false,
-            converter_exponent_strategy: Vec::new(),
-            frame_csnr_offset: Some(0),
-            frame_fsnr_offset: Some(0),
-            transient_processors: vec![None],
-            spectral_extension_attenuation: vec![None],
-            block_start_info_present: false,
-            block_start_info_bit_len: 0,
-            block_payload_start_bit_offset: 0,
-        };
+        let audio_frame = single_block_audio_frame(1, false);
+        let mut state = BlockSyntaxState::new(1, false, 0);
 
         let skip_fields = super::collect_skip_fields_without_block_start(
             &block_payload,
@@ -2900,11 +3172,161 @@ mod tests {
             false,
             &audio_frame,
             block_payload.len() * 8,
-            0,
+            &mut state,
         )
         .expect("single-block payload with footer prefix should parse");
 
         assert_eq!(skip_fields.len(), 1);
         assert_eq!(skip_fields[0].bytes, emdf);
+    }
+
+    #[test]
+    fn extracts_aux_data_from_single_block_coupling_without_block_start_info() {
+        let emdf = build_emdf_block(14, &[0xAA]);
+        let block_payload = build_single_block_coupling_payload(FrameType::Independent, &emdf);
+        let audio_frame = single_block_audio_frame(3, true);
+        let mut state = BlockSyntaxState::new(3, false, 0);
+
+        let skip_fields = super::collect_skip_fields_without_block_start(
+            &block_payload,
+            FrameType::Independent,
+            1,
+            3,
+            3,
+            false,
+            &audio_frame,
+            block_payload.len() * 8,
+            &mut state,
+        )
+        .expect("single-block payload with coupling should parse");
+
+        assert_eq!(skip_fields.len(), 1);
+        assert_eq!(skip_fields[0].bytes, emdf);
+    }
+
+    #[test]
+    fn decodes_single_block_coupling_pcm_to_silence() {
+        let payload = build_single_block_coupling_payload(FrameType::Independent, &[]);
+        let audio_frame = single_block_audio_frame(3, true);
+        let info = AccessUnitInfo {
+            frame_size: payload.len(),
+            bitstream_id: 16,
+            frame_type: FrameType::Independent,
+            substreamid: 0,
+            sample_rate: 48_000,
+            num_blocks: 1,
+            channel_mode: 3,
+            channels: 3,
+            fullband_channels: 3,
+            lfe_on: false,
+            addbsi_present: false,
+            extension_type_a: false,
+            complexity_index_type_a: 0,
+            mixing_metadata_present: false,
+            informational_metadata_present: false,
+            addbsi_bytes: Vec::new(),
+            body_start_bit_offset: 0,
+            audio_frame: audio_frame.clone(),
+            skip_fields: Vec::new(),
+            trailing_aux_data: Vec::new(),
+            aux_data: Vec::new(),
+            aux_parse_status: super::AuxParseStatus::Disabled,
+            emdf_source: EmdfSource::None,
+            emdf_blocks: Vec::new(),
+            emdf_block_count: 0,
+            first_emdf_sync_offset: None,
+        };
+        let mut state = BlockSyntaxState::new(3, false, 0);
+        let mut reader = super::BitReader::new(&payload);
+        let mut imdct = vec![
+            super::ImdctState::new(),
+            super::ImdctState::new(),
+            super::ImdctState::new(),
+        ];
+        let mut channels = vec![vec![1.0f32; 256], vec![1.0f32; 256], vec![1.0f32; 256]];
+
+        decode_block_core_pcm(
+            &mut reader,
+            0,
+            &info,
+            &mut state,
+            &mut imdct,
+            None,
+            &mut channels,
+            None,
+        )
+        .expect("coupling PCM block should decode");
+
+        assert!(
+            channels
+                .iter()
+                .flat_map(|channel| channel.iter())
+                .all(|sample| sample.abs() < 1e-6)
+        );
+    }
+
+    #[test]
+    fn pcm_channel_order_supports_dual_mono_and_rear_center_layouts() {
+        assert_eq!(
+            super::fullband_channel_order(0).expect("dual mono should map"),
+            &[BedChannel::Center, BedChannel::Center]
+        );
+        assert_eq!(
+            super::fullband_channel_order(4).expect("rear-center stereo should map"),
+            &[
+                BedChannel::FrontLeft,
+                BedChannel::FrontRight,
+                BedChannel::RearCenter,
+            ]
+        );
+        assert_eq!(
+            super::fullband_channel_order(5).expect("rear-center 4.0 should map"),
+            &[
+                BedChannel::FrontLeft,
+                BedChannel::Center,
+                BedChannel::FrontRight,
+                BedChannel::RearCenter,
+            ]
+        );
+    }
+
+    #[test]
+    fn ac3_convert_frame_type_uses_general_pcm_path() {
+        let mut frame = build_single_block_payload(FrameType::Ac3Convert, &[]);
+        frame.resize(32, 0);
+        let info = AccessUnitInfo {
+            frame_size: frame.len(),
+            bitstream_id: 16,
+            frame_type: FrameType::Ac3Convert,
+            substreamid: 0,
+            sample_rate: 48_000,
+            num_blocks: 1,
+            channel_mode: 1,
+            channels: 1,
+            fullband_channels: 1,
+            lfe_on: false,
+            addbsi_present: false,
+            extension_type_a: false,
+            complexity_index_type_a: 0,
+            mixing_metadata_present: false,
+            informational_metadata_present: false,
+            addbsi_bytes: Vec::new(),
+            body_start_bit_offset: 0,
+            audio_frame: single_block_audio_frame(1, false),
+            skip_fields: Vec::new(),
+            trailing_aux_data: Vec::new(),
+            aux_data: Vec::new(),
+            aux_parse_status: super::AuxParseStatus::Disabled,
+            emdf_source: EmdfSource::None,
+            emdf_blocks: Vec::new(),
+            emdf_block_count: 0,
+            first_emdf_sync_offset: None,
+        };
+
+        let mut state = CoreDecodeState::default();
+        let pcm = super::decode_core_pcm_frame_with_state(&frame, &info, &mut state)
+            .expect("converted frame should decode through PCM path");
+        assert_eq!(pcm.sample_rate, 48_000);
+        assert_eq!(pcm.fullband_channel_order, vec![BedChannel::Center]);
     }
 }

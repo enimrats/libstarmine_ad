@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::metadata::MetadataParseState;
-use super::syncframe::{AccessUnitInfo, ParseError, inspect_access_unit_with_metadata_state};
+use super::syncframe::{
+    AccessUnitInfo, AuxDataDecodeState, ParseError, inspect_access_unit_with_metadata_state,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 /// Result returned by [`Decoder::push_access_unit`].
@@ -21,6 +23,7 @@ pub struct PushResult {
 /// the original stream order.
 pub struct Decoder {
     frames_seen: u64,
+    aux_state: AuxDataDecodeState,
     metadata_state: MetadataParseState,
     debug_log_level: log::Level,
 }
@@ -29,6 +32,7 @@ impl Default for Decoder {
     fn default() -> Self {
         Self {
             frames_seen: 0,
+            aux_state: AuxDataDecodeState::default(),
             metadata_state: MetadataParseState::default(),
             debug_log_level: log::Level::Debug,
         }
@@ -46,6 +50,7 @@ impl Decoder {
     /// Call this after seeks, packet loss, or any discontinuity that breaks frame order.
     pub fn reset(&mut self) {
         self.frames_seen = 0;
+        self.aux_state.reset();
         self.metadata_state.reset();
     }
 
@@ -70,7 +75,11 @@ impl Decoder {
     /// errors so the caller can keep access-unit boundaries explicit.
     pub fn push_access_unit(&mut self, access_unit: &[u8]) -> Result<PushResult, ParseError> {
         self.apply_debug_log_level();
-        let info = inspect_access_unit_with_metadata_state(access_unit, &mut self.metadata_state)?;
+        let info = inspect_access_unit_with_metadata_state(
+            access_unit,
+            &mut self.metadata_state,
+            Some(&mut self.aux_state),
+        )?;
 
         if access_unit.len() < info.frame_size {
             return Err(ParseError::TruncatedFrame {

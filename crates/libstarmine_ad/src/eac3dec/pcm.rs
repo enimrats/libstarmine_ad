@@ -3,8 +3,8 @@
 use super::joc::{JocObjectDecoderState, JocObjectMatrices};
 use super::metadata::{JocPayload, MetadataParseState, OamdPayload, ParsedEmdfPayloadData};
 use super::syncframe::{
-    AccessUnitInfo, CoreDecodeState, ParseError, decode_core_pcm_frame_with_state,
-    inspect_access_unit_with_metadata_state,
+    AccessUnitInfo, AuxDataDecodeState, CoreDecodeState, ParseError,
+    decode_core_pcm_frame_with_state, inspect_access_unit_with_metadata_state,
 };
 use crate::renderer::BedChannel;
 
@@ -80,6 +80,7 @@ pub struct ObjectPcmPushResult {
 /// preserve frame order and call [`PcmDecoder::reset`] after discontinuities.
 pub struct PcmDecoder {
     frames_seen: u64,
+    aux_state: AuxDataDecodeState,
     core_state: CoreDecodeState,
     metadata_state: MetadataParseState,
     debug_log_level: log::Level,
@@ -89,6 +90,7 @@ impl Default for PcmDecoder {
     fn default() -> Self {
         Self {
             frames_seen: 0,
+            aux_state: AuxDataDecodeState::default(),
             core_state: CoreDecodeState::default(),
             metadata_state: MetadataParseState::default(),
             debug_log_level: log::Level::Debug,
@@ -105,6 +107,7 @@ impl PcmDecoder {
     /// Reset all cross-frame decode state.
     pub fn reset(&mut self) {
         self.frames_seen = 0;
+        self.aux_state.reset();
         self.core_state.reset();
         self.metadata_state.reset();
     }
@@ -127,7 +130,11 @@ impl PcmDecoder {
     /// Decode one complete access unit into core PCM.
     pub fn push_access_unit(&mut self, access_unit: &[u8]) -> Result<PcmPushResult, ParseError> {
         self.apply_debug_log_level();
-        let info = inspect_access_unit_with_metadata_state(access_unit, &mut self.metadata_state)?;
+        let info = inspect_access_unit_with_metadata_state(
+            access_unit,
+            &mut self.metadata_state,
+            Some(&mut self.aux_state),
+        )?;
 
         if access_unit.len() < info.frame_size {
             return Err(ParseError::TruncatedFrame {
@@ -159,6 +166,7 @@ impl PcmDecoder {
 /// not carry the required dynamic-object payloads.
 pub struct ObjectPcmDecoder {
     frames_seen: u64,
+    aux_state: AuxDataDecodeState,
     core_state: CoreDecodeState,
     joc_state: JocObjectDecoderState,
     metadata_state: MetadataParseState,
@@ -169,6 +177,7 @@ impl Default for ObjectPcmDecoder {
     fn default() -> Self {
         Self {
             frames_seen: 0,
+            aux_state: AuxDataDecodeState::default(),
             core_state: CoreDecodeState::default(),
             joc_state: JocObjectDecoderState::default(),
             metadata_state: MetadataParseState::default(),
@@ -186,6 +195,7 @@ impl ObjectPcmDecoder {
     /// Reset all cross-frame decode state.
     pub fn reset(&mut self) {
         self.frames_seen = 0;
+        self.aux_state.reset();
         self.core_state.reset();
         self.joc_state.reset();
         self.metadata_state.reset();
@@ -222,7 +232,11 @@ impl ObjectPcmDecoder {
         access_unit: &[u8],
     ) -> Result<Option<ObjectPcmPushResult>, ParseError> {
         self.apply_debug_log_level();
-        let info = inspect_access_unit_with_metadata_state(access_unit, &mut self.metadata_state)?;
+        let info = inspect_access_unit_with_metadata_state(
+            access_unit,
+            &mut self.metadata_state,
+            Some(&mut self.aux_state),
+        )?;
 
         if access_unit.len() < info.frame_size {
             return Err(ParseError::TruncatedFrame {

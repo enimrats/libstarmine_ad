@@ -249,6 +249,34 @@ impl AllocationState {
         result
     }
 
+    pub(crate) fn read_coupling_exponents(
+        &mut self,
+        reader: &mut super::bitstream::BitReader<'_>,
+        strategy: ExpStrategy,
+        start_mantissa: usize,
+        end_mantissa: usize,
+        groups: usize,
+    ) -> Result<(), ParseError> {
+        let absolute_exponent = reader.read_bits(4).ok_or(ParseError::ShortPacket)? as i32;
+        self.grouped_scratch.clear();
+        self.grouped_scratch.reserve(groups);
+        for _ in 0..groups {
+            self.grouped_scratch
+                .push(reader.read_bits(7).ok_or(ParseError::ShortPacket)? as i32);
+        }
+        let grouped = std::mem::take(&mut self.grouped_scratch);
+        let result = self.decode_grouped_exponents(
+            strategy,
+            start_mantissa,
+            start_mantissa + 1,
+            end_mantissa,
+            absolute_exponent,
+            &grouped,
+        );
+        self.grouped_scratch = grouped;
+        result
+    }
+
     pub(crate) fn allocate(
         &mut self,
         start: usize,
@@ -531,7 +559,7 @@ impl AllocationState {
         };
 
         let mut current_exponent = absolute_exponent;
-        self.exponents[0] = current_exponent;
+        self.exponents[start_mantissa] = current_exponent;
         let mut mantissa = exponent_offset;
         for &group in grouped {
             current_exponent += group / 25 - 2;

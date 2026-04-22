@@ -8,6 +8,7 @@ pub enum BedChannel {
     LowFrequencyEffects,
     SurroundLeft,
     SurroundRight,
+    RearCenter,
     RearLeft,
     RearRight,
     TopFrontLeft,

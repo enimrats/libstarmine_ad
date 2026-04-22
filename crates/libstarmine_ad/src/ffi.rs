@@ -5,9 +5,9 @@ use std::ptr;
 use std::slice;
 
 use crate::eac3dec::{
-    AccessUnitInfo, CoreDecodeState, CorePcmFrame, Decoder as Eac3Decoder, FrameType,
-    JocObjectDecoderState, MetadataParseState, ParseError, ParsedEmdfPayloadData, PushResult,
-    decode_core_pcm_frame_with_state_into, inspect_access_unit_with_metadata_state,
+    AccessUnitInfo, AuxDataDecodeState, CoreDecodeState, CorePcmFrame, Decoder as Eac3Decoder,
+    FrameType, JocObjectDecoderState, MetadataParseState, ParseError, ParsedEmdfPayloadData,
+    PushResult, decode_core_pcm_frame_with_state_into, inspect_access_unit_with_metadata_state,
     render_input_from_eac3_parts,
 };
 use crate::renderer::{BedChannel, Render714Error, Render714Frame, Renderer714};
@@ -78,6 +78,7 @@ pub enum StarmineAdBedChannel {
     WideLeft = 14,
     WideRight = 15,
     LowFrequencyEffects2 = 16,
+    RearCenter = 17,
 }
 
 impl From<BedChannel> for StarmineAdBedChannel {
@@ -89,6 +90,7 @@ impl From<BedChannel> for StarmineAdBedChannel {
             BedChannel::LowFrequencyEffects => Self::LowFrequencyEffects,
             BedChannel::SurroundLeft => Self::SurroundLeft,
             BedChannel::SurroundRight => Self::SurroundRight,
+            BedChannel::RearCenter => Self::RearCenter,
             BedChannel::RearLeft => Self::RearLeft,
             BedChannel::RearRight => Self::RearRight,
             BedChannel::TopFrontLeft => Self::TopFrontLeft,
@@ -401,6 +403,7 @@ static STATUS_TRUEHD_INVALID_METADATA: &[u8] = b"truehd-invalid-metadata\0";
 #[derive(Debug)]
 pub struct StarmineAdEac3Renderer714Handle {
     frames_seen: u64,
+    aux_state: AuxDataDecodeState,
     core_state: CoreDecodeState,
     core_pcm: CorePcmFrame,
     joc_state: JocObjectDecoderState,
@@ -414,6 +417,7 @@ impl Default for StarmineAdEac3Renderer714Handle {
     fn default() -> Self {
         Self {
             frames_seen: 0,
+            aux_state: AuxDataDecodeState::default(),
             core_state: CoreDecodeState::default(),
             core_pcm: CorePcmFrame {
                 sample_rate: 0,
@@ -433,6 +437,7 @@ impl Default for StarmineAdEac3Renderer714Handle {
 impl StarmineAdEac3Renderer714Handle {
     fn reset(&mut self) {
         self.frames_seen = 0;
+        self.aux_state.reset();
         self.core_state.reset();
         self.joc_state.reset();
         self.metadata_state.reset();
@@ -448,8 +453,12 @@ impl StarmineAdEac3Renderer714Handle {
     fn push_access_unit(&mut self, access_unit: &[u8]) -> Result<AccessUnitInfo, StarmineAdStatus> {
         self.clear_last_rendered();
 
-        let info = inspect_access_unit_with_metadata_state(access_unit, &mut self.metadata_state)
-            .map_err(StarmineAdStatus::from_parse_error)?;
+        let info = inspect_access_unit_with_metadata_state(
+            access_unit,
+            &mut self.metadata_state,
+            Some(&mut self.aux_state),
+        )
+        .map_err(StarmineAdStatus::from_parse_error)?;
 
         if access_unit.len() < info.frame_size {
             return Err(StarmineAdStatus::TruncatedFrame);

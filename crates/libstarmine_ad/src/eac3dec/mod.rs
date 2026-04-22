@@ -29,5 +29,6 @@ pub(crate) use joc::JocObjectDecoderState;
 pub(crate) use metadata::MetadataParseState;
 pub(crate) use render_bridge::render_input_from_eac3_parts;
 pub(crate) use syncframe::{
-    CoreDecodeState, decode_core_pcm_frame_with_state_into, inspect_access_unit_with_metadata_state,
+    AuxDataDecodeState, CoreDecodeState, decode_core_pcm_frame_with_state_into,
+    inspect_access_unit_with_metadata_state,
 };

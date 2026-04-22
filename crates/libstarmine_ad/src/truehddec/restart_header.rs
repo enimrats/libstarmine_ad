@@ -411,14 +411,16 @@ impl RestartHeader {
 
         rh.restart_header_crc = reader.get_n(8)?;
 
-        let crc = reader.crc8_check(&state.crc_restart_block_header, start_pos, len)?;
+        if crate::truehddec::ENABLE_CRC_CHECKS {
+            let crc = reader.crc8_check(&state.crc_restart_block_header, start_pos, len)?;
 
-        if crc != rh.restart_header_crc {
-            return Err((RestartHeaderError::RestartHeaderCrcMismatch {
-                calculated: crc,
-                read: rh.restart_header_crc,
-            })
-            .into());
+            if crc != rh.restart_header_crc {
+                return Err((RestartHeaderError::RestartHeaderCrcMismatch {
+                    calculated: crc,
+                    read: rh.restart_header_crc,
+                })
+                .into());
+            }
         }
 
         state.reset_parser_substream_state();

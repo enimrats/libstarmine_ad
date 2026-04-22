@@ -4,6 +4,8 @@
 mod decoder;
 mod render_bridge;
 
+pub(crate) const ENABLE_CRC_CHECKS: bool = cfg!(debug_assertions);
+
 #[macro_use]
 pub(crate) mod errors;
 

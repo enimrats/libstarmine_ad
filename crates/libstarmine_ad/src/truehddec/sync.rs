@@ -453,19 +453,21 @@ impl MajorSyncInfo {
 
         ms.major_sync_info_crc = reader.get_n(16)?;
 
-        let crc = reader.crc16_check(&state.crc_major_sync_info, start_pos, len)?;
+        if crate::truehddec::ENABLE_CRC_CHECKS {
+            let crc = reader.crc16_check(&state.crc_major_sync_info, start_pos, len)?;
 
-        if crc != ms.major_sync_info_crc {
-            log_or_err!(
-                state,
-                Error,
-                (SyncError::MajorSyncCrcMismatch {
-                    calculated: crc,
-                    read: ms.major_sync_info_crc
-                })
-            );
-        } else {
-            // for gap check
+            if crc != ms.major_sync_info_crc {
+                log_or_err!(
+                    state,
+                    Error,
+                    (SyncError::MajorSyncCrcMismatch {
+                        calculated: crc,
+                        read: ms.major_sync_info_crc
+                    })
+                );
+            } else {
+                // for gap check
+            }
         }
 
         Ok(ms)

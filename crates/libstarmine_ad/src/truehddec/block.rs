@@ -15,6 +15,7 @@
 
 use log::Level::Warn;
 use log::{info, trace, warn};
+use std::mem::MaybeUninit;
 
 use crate::truehddec::process::decode::DecoderState;
 use crate::truehddec::process::parse::{ParserState, ParserSubstreamState};
@@ -42,14 +43,26 @@ pub struct BlockHeader {
 ///
 /// Contains 8-160 samples per channel with optional restart header,
 /// block header, and compressed audio data.
-#[derive(Debug)]
 pub struct Block {
     pub restart_header: Option<RestartHeader>,
     pub block_header: Option<BlockHeader>,
     pub block_data_bits: Option<u16>,
-    pub bypassed_lsb: [[i32; 16]; 160],
-    pub block_data: [[i32; 16]; 160],
+    bypassed_lsb: [[MaybeUninit<i32>; 16]; 160],
+    block_data: [[MaybeUninit<i32>; 16]; 160],
+    decoded_block_size: usize,
     pub block_header_crc: u8,
+}
+
+impl std::fmt::Debug for Block {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Block")
+            .field("restart_header", &self.restart_header)
+            .field("block_header", &self.block_header)
+            .field("block_data_bits", &self.block_data_bits)
+            .field("decoded_block_size", &self.decoded_block_size)
+            .field("block_header_crc", &self.block_header_crc)
+            .finish()
+    }
 }
 
 impl Default for Block {
@@ -58,9 +71,38 @@ impl Default for Block {
             restart_header: None,
             block_header: None,
             block_data_bits: None,
-            bypassed_lsb: [[0; 16]; 160],
-            block_data: [[0; 16]; 160],
+            bypassed_lsb: [[const { MaybeUninit::uninit() }; 16]; 160],
+            block_data: [[const { MaybeUninit::uninit() }; 16]; 160],
+            decoded_block_size: 0,
             block_header_crc: 0,
+        }
+    }
+}
+
+impl Block {
+    #[inline(always)]
+    pub fn block_data_at(&self, sample_index: usize, channel_index: usize) -> i32 {
+        debug_assert!(sample_index < self.decoded_block_size);
+        debug_assert!(channel_index < 16);
+        unsafe {
+            // `read_into` writes every `(sample_index, channel_index)` that decode will query.
+            self.block_data
+                .get_unchecked(sample_index)
+                .get_unchecked(channel_index)
+                .assume_init()
+        }
+    }
+
+    #[inline(always)]
+    pub fn bypassed_lsb_at(&self, sample_index: usize, matrix_index: usize) -> i32 {
+        debug_assert!(sample_index < self.decoded_block_size);
+        debug_assert!(matrix_index < 16);
+        unsafe {
+            // `read_into` writes every `(sample_index, matrix_index)` consumed by matrix decode.
+            self.bypassed_lsb
+                .get_unchecked(sample_index)
+                .get_unchecked(matrix_index)
+                .assume_init()
         }
     }
 }
@@ -397,6 +439,7 @@ impl Block {
                 .sum()
         };
         let check_huffman_sample_width = restart_sync_word != 0x31EC;
+        self.decoded_block_size = block_size;
 
         for (chi, &lsbs) in huff_lsbs
             .iter()
@@ -420,21 +463,21 @@ impl Block {
                 for pmi in 0..primitive_matrices {
                     let lsb_bypass_bit_count = lsb_bypass_bit_count[pmi];
 
-                    self.bypassed_lsb[blki][pmi] = if lsb_bypass_bit_count != 0 {
+                    self.bypassed_lsb[blki][pmi].write(if lsb_bypass_bit_count != 0 {
                         reader.get_n::<u8>(lsb_bypass_bit_count as u32)?
                     } else {
                         0
-                    } as i32;
+                    } as i32);
                 }
             } else {
                 for pmi in 0..primitive_matrices {
                     let lsb_bypass_used = lsb_bypass_used[pmi];
 
-                    self.bypassed_lsb[blki][pmi] = if lsb_bypass_used {
+                    self.bypassed_lsb[blki][pmi].write(if lsb_bypass_used {
                         reader.get_n::<u8>(1)?
                     } else {
                         0
-                    } as i32;
+                    } as i32);
                 }
             }
 
@@ -502,7 +545,7 @@ impl Block {
                     }
                 }
 
-                block_data[chi] = audio_data;
+                block_data[chi].write(audio_data);
             }
         }
 

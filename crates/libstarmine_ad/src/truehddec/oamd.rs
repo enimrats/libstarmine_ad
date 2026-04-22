@@ -7,6 +7,7 @@
 //! which provides spatial audio information for immersive audio playback.
 
 use std::default::Default;
+use std::io;
 use std::mem::transmute;
 
 use crate::truehddec::utils::bitstream_io::BsIoSliceReader;
@@ -239,7 +240,13 @@ impl ObjectAudioMetadataPayload {
             oamd_version += reader.get_n::<u8>(3)?;
         }
 
-        assert_eq!(oamd_version, 0, "Unsupported OAMD version {oamd_version}");
+        if oamd_version != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Unsupported OAMD version {oamd_version}"),
+            )
+            .into());
+        }
 
         let mut object_count_bits = reader.get_n::<u8>(5)?;
 
@@ -251,7 +258,7 @@ impl ObjectAudioMetadataPayload {
         state.object_count = object_count;
 
         let program_assignment = ProgramAssignment::read(state, reader)?;
-        state.program_assignment = program_assignment.clone();
+        state.program_assignment = program_assignment;
 
         let b_alternate_object_data_present = reader.get()?;
         state.b_alternate_object_data_present = b_alternate_object_data_present;
@@ -269,11 +276,11 @@ impl ObjectAudioMetadataPayload {
             evo_sample_offset: 0,
             oamd_version,
             object_count,
-            program_assignment,
+            program_assignment: std::mem::take(&mut state.program_assignment),
             b_alternate_object_data_present,
-            object_element: state.object_element.clone(),
-            trim_element: state.trim_element.clone(),
-            extended_object_element: state.extended_object_element.clone(),
+            object_element: state.object_element.take(),
+            trim_element: state.trim_element.take(),
+            extended_object_element: state.extended_object_element.take(),
             oa_element_md,
         };
 
@@ -464,7 +471,7 @@ impl ObjectElement {
                     block_index,
                 )?);
             }
-            element.object_data.push(object_data.clone());
+            element.object_data.push(object_data);
         }
 
         Ok(element)
@@ -1010,7 +1017,7 @@ impl ExtendedObjectElement {
                                             [reader.get_n::<u8>(2)? as usize];
                                 }
                                 1 => {
-                                    if let Some(prev_blk) = blk_blk.last().cloned() {
+                                    if let Some(prev_blk) = blk_blk.last().copied() {
                                         blk = prev_blk;
                                     } else {
                                         warn!(
@@ -1096,7 +1103,7 @@ impl ExtendedObjectElement {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 #[repr(C)]
 pub struct ObjectDivergenceBlock {
     pub object_divergence: f64,

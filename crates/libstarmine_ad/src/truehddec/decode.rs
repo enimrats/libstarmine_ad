@@ -410,8 +410,22 @@ impl DecoderState {
         let dither_seed = &mut ss_state.dither_seed;
         let coeff_state = &mut ss_state.coeff_state;
         let m_coeff = &mut ss_state.m_coeff;
-        let block_data = &block.block_data;
-        let bypassed_lsb = &block.bypassed_lsb;
+        let mut quantiser_masks_i64 = [0i64; 16];
+        let mut quantiser_masks_i32 = [0i32; 16];
+
+        for chi in min_chan..=max_chan {
+            let mask = !((1i32 << quantiser_step_size[chi]) - 1);
+            quantiser_masks_i32[chi] = mask;
+            quantiser_masks_i64[chi] = i64::from(mask);
+        }
+
+        if max_matrix_chan > max_chan {
+            for chi in (max_chan + 1)..=max_matrix_chan {
+                let mask = !((1i32 << quantiser_step_size[chi]) - 1);
+                quantiser_masks_i32[chi] = mask;
+                quantiser_masks_i64[chi] = i64::from(mask);
+            }
+        }
 
         let (max_val, min_val) = if restart_sync_word == 0x31EC {
             (1 << 31, -(1 << 31))
@@ -430,12 +444,12 @@ impl DecoderState {
                 let fir_order = order[0][chi];
                 let iir_order = order[1][chi];
                 let coeff_q_shift = coeff_q[0][chi];
-                let quantiser_mask = !((1 << quantiser_step_size[chi]) - 1);
+                let quantiser_mask = quantiser_masks_i64[chi];
                 let fir_coeff = &coeff[0][chi];
                 let iir_coeff = &coeff[1][chi];
 
                 for blki in 0..block_size {
-                    let audio_data = block_data[blki][chi] as i64;
+                    let audio_data = i64::from(block.block_data_at(blki, chi));
                     let acc = dot_product_i32_prefix(fir_coeff, &fir_history, fir_order)
                         + dot_product_i32_prefix(iir_coeff, &iir_history, iir_order);
 
@@ -478,7 +492,6 @@ impl DecoderState {
                 0x31EA => {
                     for blki in 0..block_size {
                         let rematrix_buffer = &mut rematrix_buffer[blki];
-                        let bypassed_lsb = &bypassed_lsb[blki];
                         let dither_seed_shr7 = *dither_seed >> 7;
 
                         rematrix_buffer[max_matrix_chan + 1] =
@@ -499,22 +512,20 @@ impl DecoderState {
                             );
 
                             rematrix_buffer[matrix_ch] = (((acc >> 18) as i32)
-                                & (!((1 << quantiser_step_size[matrix_ch]) - 1)))
-                                + bypassed_lsb[pmi];
+                                & quantiser_masks_i32[matrix_ch])
+                                + block.bypassed_lsb_at(blki, pmi);
                         }
                     }
                 }
                 0x31EB => {
+                    let dither_len = samples_per_au.next_power_of_two();
+                    let dither_index_mask = dither_len - 1;
                     if *decoded_sample_len == 0 {
-                        let dither_len = samples_per_au.next_power_of_two();
                         fill_dither_31eb(&mut dither_table[..dither_len], dither_seed);
                     }
 
-                    let dither_index_mask = samples_per_au.next_power_of_two() - 1;
-
                     for blki in 0..block_size {
                         let rematrix_buffer = &mut rematrix_buffer[blki];
-                        let bypassed_lsb = &bypassed_lsb[blki];
                         let blki_abs = blki + *decoded_sample_len;
 
                         for pmi in 0..primitive_matrices {
@@ -535,24 +546,22 @@ impl DecoderState {
                             }
 
                             rematrix_buffer[matrix_ch] = (((acc >> 18) as i32)
-                                & (!((1 << quantiser_step_size[matrix_ch]) - 1)))
-                                + bypassed_lsb[pmi];
+                                & quantiser_masks_i32[matrix_ch])
+                                + block.bypassed_lsb_at(blki, pmi);
                         }
                     }
                 }
                 0x31EC => {
+                    let dither_len = samples_per_au.next_power_of_two();
+                    let dither_index_mask = dither_len - 1;
                     if *decoded_sample_len == 0 {
-                        let dither_len = samples_per_au.next_power_of_two();
                         fill_dither_31eb(&mut dither_table[..dither_len], dither_seed);
                     }
-
-                    let dither_index_mask = samples_per_au.next_power_of_two() - 1;
 
                     let samples_per_au_recip = (1 << 16) / samples_per_au as i64;
 
                     for blki in 0..block_size {
                         let rematrix_buffer = &mut rematrix_buffer[blki];
-                        let bypassed_lsb = &bypassed_lsb[blki];
                         let blki_abs = blki + *decoded_sample_len;
 
                         for pmi in 0..primitive_matrices {
@@ -577,8 +586,8 @@ impl DecoderState {
                                 (acc_delta >> 18) * (blki_abs as i64) * (samples_per_au_recip << 2);
 
                             rematrix_buffer[matrix_ch] = (((acc >> 18) as i32)
-                                & (!((1 << quantiser_step_size[matrix_ch]) - 1)))
-                                + bypassed_lsb[pmi];
+                                & quantiser_masks_i32[matrix_ch])
+                                + block.bypassed_lsb_at(blki, pmi);
                         }
                     }
 
@@ -604,8 +613,9 @@ impl DecoderState {
                 let mut lossless_check_data = 0;
 
                 for blki in 0..block_size {
-                    let sample = rematrix_buffer[blki];
-                    let mut output = [0; 16];
+                    let sample = &rematrix_buffer[blki];
+                    let output = &mut output_buffer[blki];
+                    output.fill(0);
 
                     for chi in 0..=max_matrix_chan {
                         let ch_assign = ch_assign[chi];
@@ -622,8 +632,6 @@ impl DecoderState {
 
                         lossless_check_data ^= (*output & 0xFFFFFF) << (chi & 7);
                     }
-
-                    output_buffer[blki] = output;
                 }
 
                 ss_state.lossless_check_i32 ^= lossless_check_data;
@@ -660,6 +668,12 @@ impl DecoderState {
 
 #[inline]
 fn push_history_front(history: &mut [i32; 8], sample: i32) {
-    history.copy_within(..7, 1);
+    history[7] = history[6];
+    history[6] = history[5];
+    history[5] = history[4];
+    history[4] = history[3];
+    history[3] = history[2];
+    history[2] = history[1];
+    history[1] = history[0];
     history[0] = sample;
 }

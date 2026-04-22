@@ -202,13 +202,12 @@ impl ObjectPcmDecoder {
         }))
         .map_err(|panic| TrueHdError::decode(format!("panic: {}", panic_message(panic))))?
         .map_err(TrueHdError::decode)?;
-        let cached_layout = self.layout.clone();
         let decoded = self.decoder.decoded_access_unit();
 
         self.access_units_seen += 1;
 
         let layout = Self::resolve_layout(
-            cached_layout.as_ref(),
+            self.layout.as_ref(),
             decoded.channel_labels,
             decoded.channel_count,
             decoded.oamd,

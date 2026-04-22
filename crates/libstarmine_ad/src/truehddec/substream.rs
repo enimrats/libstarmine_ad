@@ -241,35 +241,39 @@ impl SubstreamSegment {
         let len = reader.position()? - start_pos;
 
         if crc_present {
-            let parity = reader.parity_check_for_last_n_bits(len)? ^ 0xa9;
+            if crate::truehddec::ENABLE_CRC_CHECKS {
+                let parity = reader.parity_check_for_last_n_bits(len)? ^ 0xa9;
+                ss.substream_parity = reader.get_n(8)?;
+                ss.substream_crc = reader.get_n(8)?;
 
-            ss.substream_parity = reader.get_n(8)?;
-            ss.substream_crc = reader.get_n(8)?;
+                if parity != ss.substream_parity {
+                    log_or_err!(
+                        state,
+                        log::Level::Error,
+                        (SubstreamError::ParityMismatch {
+                            substream: state.substream_index,
+                            calculated: parity,
+                            read: ss.substream_parity
+                        })
+                    );
+                }
 
-            if parity != ss.substream_parity {
-                log_or_err!(
-                    state,
-                    log::Level::Error,
-                    (SubstreamError::ParityMismatch {
-                        substream: state.substream_index,
-                        calculated: parity,
-                        read: ss.substream_parity
-                    })
-                );
-            }
+                let crc = reader.crc8_check(&state.crc_substream, start_pos, len)?;
 
-            let crc = reader.crc8_check(&state.crc_substream, start_pos, len)?;
-
-            if crc != ss.substream_crc {
-                log_or_err!(
-                    state,
-                    log::Level::Error,
-                    (SubstreamError::CrcMismatch {
-                        substream: state.substream_index,
-                        calculated: crc,
-                        read: ss.substream_crc
-                    })
-                );
+                if crc != ss.substream_crc {
+                    log_or_err!(
+                        state,
+                        log::Level::Error,
+                        (SubstreamError::CrcMismatch {
+                            substream: state.substream_index,
+                            calculated: crc,
+                            read: ss.substream_crc
+                        })
+                    );
+                }
+            } else {
+                ss.substream_parity = reader.get_n(8)?;
+                ss.substream_crc = reader.get_n(8)?;
             }
         }
 

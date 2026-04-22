@@ -494,19 +494,20 @@ impl DecoderState {
                         *dither_seed =
                             (dither_seed_shr7 ^ (dither_seed_shr7 << 5) ^ (*dither_seed << 16))
                                 & 0x7FFFFF;
+                    }
 
-                        for pmi in 0..primitive_matrices {
-                            let matrix_ch = matrix_ch[pmi] as usize;
-                            let acc = dot_product_i32_prefix(
-                                rematrix_buffer,
-                                &m_coeff[pmi],
-                                max_matrix_chan + 3,
-                            );
-
-                            rematrix_buffer[matrix_ch] = (((acc >> 18) as i32)
-                                & quantiser_masks_i32[matrix_ch])
-                                + block.bypassed_lsb_at(blki, pmi);
-                        }
+                    for pmi in 0..primitive_matrices {
+                        let matrix_ch = matrix_ch[pmi] as usize;
+                        crate::truehddec::simd::apply_matrix_31ea(
+                            rematrix_buffer,
+                            &m_coeff[pmi],
+                            max_matrix_chan + 3,
+                            matrix_ch,
+                            quantiser_masks_i32[matrix_ch],
+                            block,
+                            pmi,
+                            block_size,
+                        );
                     }
                 }
                 0x31EB => {
@@ -516,31 +517,25 @@ impl DecoderState {
                         fill_dither_31eb(&mut dither_table[..dither_len], dither_seed);
                     }
 
-                    for blki in 0..block_size {
-                        let rematrix_buffer = &mut rematrix_buffer[blki];
-                        let blki_abs = blki + *decoded_sample_len;
+                    for pmi in 0..primitive_matrices {
+                        let dither_scale = dither_scale[pmi] as i64;
+                        let matrix_ch = matrix_ch[pmi] as usize;
 
-                        for pmi in 0..primitive_matrices {
-                            let dither_scale = dither_scale[pmi] as i64;
-                            let matrix_ch = matrix_ch[pmi] as usize;
-                            let mut acc = dot_product_i32_prefix(
-                                rematrix_buffer,
-                                &m_coeff[pmi],
-                                max_matrix_chan + 1,
-                            );
-
-                            let dither_index =
-                                (primitive_matrices - pmi) * (2 * blki_abs + 1) + blki_abs;
-
-                            if dither_scale != 0 {
-                                acc += (dither_table[dither_index & dither_index_mask] as i64)
-                                    << (11 + dither_scale);
-                            }
-
-                            rematrix_buffer[matrix_ch] = (((acc >> 18) as i32)
-                                & quantiser_masks_i32[matrix_ch])
-                                + block.bypassed_lsb_at(blki, pmi);
-                        }
+                        crate::truehddec::simd::apply_matrix_31eb(
+                            rematrix_buffer,
+                            &m_coeff[pmi],
+                            max_matrix_chan + 1,
+                            matrix_ch,
+                            quantiser_masks_i32[matrix_ch],
+                            block,
+                            pmi,
+                            block_size,
+                            primitive_matrices,
+                            dither_scale,
+                            &dither_table,
+                            dither_index_mask,
+                            *decoded_sample_len,
+                        );
                     }
                 }
                 0x31EC => {
@@ -552,35 +547,27 @@ impl DecoderState {
 
                     let samples_per_au_recip = (1 << 16) / samples_per_au as i64;
 
-                    for blki in 0..block_size {
-                        let rematrix_buffer = &mut rematrix_buffer[blki];
-                        let blki_abs = blki + *decoded_sample_len;
+                    for pmi in 0..primitive_matrices {
+                        let dither_scale = dither_scale[pmi] as u64;
+                        let matrix_ch = matrix_ch[pmi] as usize;
 
-                        for pmi in 0..primitive_matrices {
-                            let dither_scale = dither_scale[pmi] as u64;
-                            let matrix_ch = matrix_ch[pmi] as usize;
-                            let (mut acc, acc_delta) = dual_dot_product_i32_prefix(
-                                rematrix_buffer,
-                                &m_coeff[pmi],
-                                &delta_cf[pmi],
-                                max_matrix_chan + 1,
-                            );
-
-                            let dither_index =
-                                (primitive_matrices - pmi) * (2 * blki_abs + 1) + blki_abs;
-
-                            if dither_scale != 0 {
-                                acc += (dither_table[dither_index & dither_index_mask] as i64)
-                                    << (11 + dither_scale);
-                            }
-
-                            acc +=
-                                (acc_delta >> 18) * (blki_abs as i64) * (samples_per_au_recip << 2);
-
-                            rematrix_buffer[matrix_ch] = (((acc >> 18) as i32)
-                                & quantiser_masks_i32[matrix_ch])
-                                + block.bypassed_lsb_at(blki, pmi);
-                        }
+                        crate::truehddec::simd::apply_matrix_31ec(
+                            rematrix_buffer,
+                            &m_coeff[pmi],
+                            &delta_cf[pmi],
+                            max_matrix_chan + 1,
+                            matrix_ch,
+                            quantiser_masks_i32[matrix_ch],
+                            block,
+                            pmi,
+                            block_size,
+                            primitive_matrices,
+                            dither_scale,
+                            &dither_table,
+                            dither_index_mask,
+                            *decoded_sample_len,
+                            samples_per_au_recip,
+                        );
                     }
 
                     if *decoded_sample_len + block_size == samples_per_au {
